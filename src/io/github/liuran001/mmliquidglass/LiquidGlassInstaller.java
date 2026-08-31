@@ -321,6 +321,8 @@ final class LiquidGlassInstaller {
         sBarHeight = barHeight;
         sLastIndex = -1;
 
+        TabBarBridge.tryHookPager(backdrop);
+
         // Cosmetic cleanup cannot invalidate the structural install. If an app
         // skin changes one of these details, keep the functional floating bar
         // and report the degraded effect rather than trying to tear it back out.

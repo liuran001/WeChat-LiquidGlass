@@ -452,4 +452,24 @@ final class TabBarBridge {
         }
         return -1;
     }
+
+    private static volatile boolean sHookedPager;
+
+    static void tryHookPager(ViewGroup pager) {
+        if (sHookedPager || pager == null) return;
+        try {
+            Class<?> viewPagerCls = pager.getClass();
+            Method setItem = viewPagerCls.getMethod("setCurrentItem", int.class);
+            Method setItemSmooth = viewPagerCls.getMethod("setCurrentItem", int.class, boolean.class);
+            LiquidGlassModule.hookIntercept(setItem, chain -> {
+                Object[] args = chain.getArgs().toArray();
+                setItemSmooth.invoke(chain.getThisObject(), (Integer) args[0], true);
+                return null;
+            });
+            sHookedPager = true;
+            LiquidGlassModule.log(android.util.Log.INFO, "Hooked ViewPager: " + viewPagerCls.getName());
+        } catch (Throwable t) {
+            LiquidGlassModule.log(android.util.Log.WARN, "No ViewPager to hook: " + t);
+        }
+    }
 }

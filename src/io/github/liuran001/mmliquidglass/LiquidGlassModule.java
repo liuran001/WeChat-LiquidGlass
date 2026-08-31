@@ -47,6 +47,17 @@ public class LiquidGlassModule extends XposedModule {
                 });
     }
 
+    /** Hooks an executable, intercepting its call chain completely. */
+    static void hookIntercept(java.lang.reflect.Executable ex, InterceptCallback fn) {
+        LiquidGlassModule self = sSelf;
+        if (self == null) throw new IllegalStateException("module instance not attached yet");
+        self.hook(ex).intercept(fn::intercept);
+    }
+
+    interface InterceptCallback {
+        Object intercept(XposedInterface.Chain chain) throws Throwable;
+    }
+
     interface AfterCallback {
         void after(XposedInterface.Chain chain) throws Throwable;
     }
