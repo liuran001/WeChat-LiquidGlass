@@ -47,11 +47,24 @@ public class LiquidGlassModule extends XposedModule {
                 });
     }
 
-    /** Hooks an executable, intercepting its call chain completely. */
+    /**
+     * Hooks an executable, handing the callback the whole call chain so it can
+     * rewrite arguments, substitute a result, or drop the call outright.
+     *
+     * <p>PROTECTIVE like {@link #hookAfter}: a throw out of the callback must
+     * never surface in the host's own frame. The chain here wraps app calls
+     * that legitimately throw — ViewPager2 rejects setCurrentItem mid
+     * fake-drag — and reflection would repackage that as an
+     * InvocationTargetException the app has no catch for.
+     */
     static void hookIntercept(java.lang.reflect.Executable ex, InterceptCallback fn) {
         LiquidGlassModule self = sSelf;
-        if (self == null) throw new IllegalStateException("module instance not attached yet");
-        self.hook(ex).intercept(fn::intercept);
+        if (self == null) {
+            throw new IllegalStateException("module instance not attached yet");
+        }
+        self.hook(ex)
+                .setExceptionMode(ExceptionMode.PROTECTIVE)
+                .intercept(fn::intercept);
     }
 
     interface InterceptCallback {

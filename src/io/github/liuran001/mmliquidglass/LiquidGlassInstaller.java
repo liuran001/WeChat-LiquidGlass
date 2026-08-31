@@ -210,6 +210,17 @@ final class LiquidGlassInstaller {
                 "stale host from a previous Activity dropped, reinstalling");
     }
 
+    /**
+     * The pager the glass is currently refracting, or null before the first
+     * install. Re-read on every use rather than captured: {@link #resetState}
+     * drops it when an Activity is recreated and the next install publishes a
+     * fresh instance, so a cached reference would go stale for the rest of the
+     * process.
+     */
+    static ViewGroup currentPager() {
+        return sPagerRef.get();
+    }
+
     private static void install(ViewGroup tabView) {
         ViewGroup parent = tabView.getParent() instanceof ViewGroup
                 ? (ViewGroup) tabView.getParent() : null;
@@ -262,9 +273,11 @@ final class LiquidGlassInstaller {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 android.view.Gravity.BOTTOM | android.view.Gravity.CENTER_HORIZONTAL);
-        // The navigation inset only counts once the window has been grown to
-        // cover it — before that the pill's parent already stops above the
-        // gesture bar, and adding it again floats the pill far too high.
+        // The navigation inset only counts once the window reaches under it —
+        // either because extendUnderNavBar grew it or because the app already
+        // draws edge to edge. Short of that the pill's parent stops above the
+        // gesture bar, and adding it again floats the pill far too high. Left
+        // out here and applied below, once that is known.
         // Anchored on the parent, not the bar: the bar is about to be detached,
         // and a detached view reports no insets at all. Reading from it later
         // would silently drop the correction and let the bar sink onto the
@@ -335,12 +348,16 @@ final class LiquidGlassInstaller {
             LiquidGlassModule.logErr("could not remove all stock tab chrome", t);
         }
 
-        boolean underNav = extendUnderNavBar(ctx);
-        if (underNav || LiquidGlassModule.app() == HostApp.QQ) {
+        // QQ is the one host where the inset counts without us growing the
+        // window: extendUnderNavBar bails out there on purpose (see it for
+        // why), but QQ already lays its own decor out edge to edge, so the
+        // pill's parent does reach under the gesture bar and the correction is
+        // owed all the same.
+        boolean insetCounts = extendUnderNavBar(ctx)
+                || LiquidGlassModule.app() == HostApp.QQ;
+        if (insetCounts) {
             hostLp.bottomMargin = bottomOffset - shadowPad + navigationInset;
             host.setLayoutParams(hostLp);
-        }
-        if (underNav || LiquidGlassModule.app() == HostApp.QQ) {
             // The first real insets dispatch can arrive either side of host
             // creation. Re-read the shared cache on the next UI turn so both
             // orders converge on the same bottom anchor.

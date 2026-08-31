@@ -453,8 +453,21 @@ final class TabBarBridge {
         return -1;
     }
 
+    /** One hook per process; the instance it applies to is resolved per call. */
     private static volatile boolean sHookedPager;
 
+    /**
+     * Restores the page transition both hosts throw away on a tab tap.
+     *
+     * <p>Neither app animates the swap itself: the bar handler calls
+     * {@code setCurrentItem(index, false)} and the pages hard-cut. Rewriting
+     * that one flag to true hands the slide back to the pager, which is the
+     * motion the droplet was already animating alongside.
+     *
+     * <p>Hooked once and left in place: the method belongs to the app's class,
+     * not to the instance, so re-hooking on every install would stack
+     * redundant chains on the same executable.
+     */
     static void tryHookPager(ViewGroup pager) {
         if (sHookedPager || pager == null) return;
         try {
@@ -470,25 +483,45 @@ final class TabBarBridge {
             if (setItemBool != null) {
                 final Method setItemSmooth = setItemBool;
                 LiquidGlassModule.hookIntercept(setItemSmooth, chain -> {
+                    // Binding is per class, so every pager in the app lands
+                    // here. On QQ the declaring class is AndroidX's own
+                    // ViewPager2, shared with the profile card carousel and
+                    // every TabLayoutMediator in the app; on WeChat it is the
+                    // WxViewPager base of the home pager. Only the backdrop the
+                    // glass is refracting may be rewritten — everywhere else an
+                    // instant jump is what the app asked for, and turning it
+                    // into a scroll animates UI this module has no business
+                    // touching.
+                    if (chain.getThisObject() != LiquidGlassInstaller.currentPager()) {
+                        return chain.proceed();
+                    }
                     Object[] args = chain.getArgs().toArray();
                     boolean smooth = false;
                     if (args.length >= 2 && args[1] instanceof Boolean) {
                         smooth = (Boolean) args[1];
                     }
                     if (!smooth) {
-                        // redirect to smooth scroll (avoid infinite loop by checking if it was false)
+                        // Re-enters this same hook one level down, where smooth
+                        // is now true and the branch below proceeds: that is
+                        // what stops it recursing.
                         setItemSmooth.invoke(chain.getThisObject(), args[0], true);
                         return null; // swallow the original hard-cut call
                     }
                     return chain.proceed(); // allow smooth calls through
                 });
                 sHookedPager = true;
-                LiquidGlassModule.log(android.util.Log.INFO, "Hooked ViewPager: " + setItemBool.getDeclaringClass().getName());
+                LiquidGlassModule.log(android.util.Log.INFO,
+                        "hooked " + setItemBool.getDeclaringClass().getName()
+                                + ".setCurrentItem(int, boolean) for the backdrop's"
+                                + " page transition");
             } else {
-                LiquidGlassModule.log(android.util.Log.WARN, "No setCurrentItem(int, boolean) found on " + pager.getClass());
+                LiquidGlassModule.log(android.util.Log.WARN,
+                        "no setCurrentItem(int, boolean) on " + pager.getClass()
+                                + ", pages will hard-cut between tabs");
             }
         } catch (Throwable t) {
-            LiquidGlassModule.log(android.util.Log.WARN, "No ViewPager to hook: " + t);
+            LiquidGlassModule.log(android.util.Log.WARN,
+                    "could not hook the backdrop pager: " + t);
         }
     }
 }
