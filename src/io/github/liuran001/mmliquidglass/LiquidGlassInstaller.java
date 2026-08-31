@@ -336,11 +336,11 @@ final class LiquidGlassInstaller {
         }
 
         boolean underNav = extendUnderNavBar(ctx);
-        if (underNav) {
+        if (underNav || LiquidGlassModule.app() == HostApp.QQ) {
             hostLp.bottomMargin = bottomOffset - shadowPad + navigationInset;
             host.setLayoutParams(hostLp);
         }
-        if (underNav) {
+        if (underNav || LiquidGlassModule.app() == HostApp.QQ) {
             // The first real insets dispatch can arrive either side of host
             // creation. Re-read the shared cache on the next UI turn so both
             // orders converge on the same bottom anchor.

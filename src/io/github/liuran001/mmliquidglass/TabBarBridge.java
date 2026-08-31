@@ -458,16 +458,35 @@ final class TabBarBridge {
     static void tryHookPager(ViewGroup pager) {
         if (sHookedPager || pager == null) return;
         try {
-            Class<?> viewPagerCls = pager.getClass();
-            Method setItem = viewPagerCls.getMethod("setCurrentItem", int.class);
-            Method setItemSmooth = viewPagerCls.getMethod("setCurrentItem", int.class, boolean.class);
-            LiquidGlassModule.hookIntercept(setItem, chain -> {
-                Object[] args = chain.getArgs().toArray();
-                setItemSmooth.invoke(chain.getThisObject(), (Integer) args[0], true);
-                return null;
-            });
-            sHookedPager = true;
-            LiquidGlassModule.log(android.util.Log.INFO, "Hooked ViewPager: " + viewPagerCls.getName());
+            Class<?> cls = pager.getClass();
+            Method setItemBool = null;
+            while (cls != null && cls != Object.class) {
+                try {
+                    setItemBool = cls.getDeclaredMethod("setCurrentItem", int.class, boolean.class);
+                    break;
+                } catch (NoSuchMethodException ignored) {}
+                cls = cls.getSuperclass();
+            }
+            if (setItemBool != null) {
+                final Method setItemSmooth = setItemBool;
+                LiquidGlassModule.hookIntercept(setItemSmooth, chain -> {
+                    Object[] args = chain.getArgs().toArray();
+                    boolean smooth = false;
+                    if (args.length >= 2 && args[1] instanceof Boolean) {
+                        smooth = (Boolean) args[1];
+                    }
+                    if (!smooth) {
+                        // redirect to smooth scroll (avoid infinite loop by checking if it was false)
+                        setItemSmooth.invoke(chain.getThisObject(), args[0], true);
+                        return null; // swallow the original hard-cut call
+                    }
+                    return chain.proceed(); // allow smooth calls through
+                });
+                sHookedPager = true;
+                LiquidGlassModule.log(android.util.Log.INFO, "Hooked ViewPager: " + setItemBool.getDeclaringClass().getName());
+            } else {
+                LiquidGlassModule.log(android.util.Log.WARN, "No setCurrentItem(int, boolean) found on " + pager.getClass());
+            }
         } catch (Throwable t) {
             LiquidGlassModule.log(android.util.Log.WARN, "No ViewPager to hook: " + t);
         }
