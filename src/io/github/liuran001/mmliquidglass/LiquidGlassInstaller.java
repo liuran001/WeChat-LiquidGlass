@@ -1799,6 +1799,9 @@ final class LiquidGlassInstaller {
         if (Build.VERSION.SDK_INT < 30) {
             return false;
         }
+        if (LiquidGlassModule.app() == HostApp.QQ) {
+            return false; // QQ NT breaks IME window insets if the root decor is hijacked
+        }
         try {
             Activity activity = activityOf(ctx);
             if (activity == null) {
