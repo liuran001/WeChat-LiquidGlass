@@ -731,11 +731,27 @@ final class TabBarBridge {
                                     ? (Float) args[1] : -1f;
                             if (offset == 0f) {
                                 if (page != target) {
+                                    LiquidGlassModule.log(android.util.Log.INFO,
+                                            "settle of page " + page
+                                                    + " held back (sliding to "
+                                                    + target + ")");
                                     return null; // passed over, not settled
                                 }
                                 sJumpTarget = -1; // arrived
+                                LiquidGlassModule.log(android.util.Log.INFO,
+                                        "settle of page " + page
+                                                + " passed through; slide done");
                             }
                         }
+                    } else if (chain.getArgs().size() > 1
+                            && chain.getArg(1) instanceof Float
+                            && (Float) chain.getArg(1) == 0f) {
+                        // No jump of ours in flight: whatever the app is doing
+                        // with this settle is its own business, but it is the
+                        // one event the top bar is rebuilt from, so it is worth
+                        // a line when it goes wrong on a device.
+                        LiquidGlassModule.log(android.util.Log.INFO,
+                                "settle of page " + chain.getArg(0));
                     }
                     return chain.proceed();
                 });
@@ -744,11 +760,18 @@ final class TabBarBridge {
                 if (stateChanged != null) {
                     LiquidGlassModule.hookIntercept(stateChanged, chain -> {
                         Object[] args = chain.getArgs().toArray();
-                        if (args.length > 0 && args[0] instanceof Integer
-                                && (Integer) args[0] == 1) {
-                            // DRAGGING: a finger took over, so the jump is over
-                            // and its destination will never be reported.
-                            sJumpTarget = -1;
+                        if (args.length > 0 && args[0] instanceof Integer) {
+                            int state = (Integer) args[0];
+                            LiquidGlassModule.log(android.util.Log.INFO,
+                                    "scroll state " + state
+                                            + (sJumpTarget >= 0
+                                                    ? " (jump to " + sJumpTarget + ")"
+                                                    : ""));
+                            if (state == 1) {
+                                // DRAGGING: a finger took over, so the jump is
+                                // over and its destination will never report.
+                                sJumpTarget = -1;
+                            }
                         }
                         return chain.proceed();
                     });
