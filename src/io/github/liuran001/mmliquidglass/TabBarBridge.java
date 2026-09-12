@@ -532,20 +532,27 @@ final class TabBarBridge {
      * that one flag to true hands the slide back to the pager, which is the
      * motion the droplet was already animating alongside.
      *
-     * <p>Only a <em>one-page</em> move is rewritten, because that is the only
-     * shape the hosts' own page-change handling was written for. A finger can
-     * only ever drag across one boundary, so everything hanging off
-     * {@code onPageScrolled} sees adjacent pages and nothing else — on WeChat
-     * that includes the ActionBar's title visibility, which
-     * {@code MainTabUI}/{@code HomeUI} drive from the current tab index held
-     * against the page and offset the pager reports. An animated jump across
-     * several pages walks the intermediate ones, and when a frame lands exactly
-     * on one of those boundaries the offset arrives as {@code 0.0f} for a page
-     * the user is not on, which the host reads as "this page has settled" and
-     * acts on. With two such jumps back to back — the reported 微信↔我 double
-     * tap — the title can be left at {@code View.GONE} and the top bar comes
-     * back blank. A ±1 move stays inside what a drag produces, so the slide is
-     * kept there and longer jumps keep the app's own hard cut.
+     * <p>A one-page move is the shape the hosts' own page-change handling was
+     * written for — a finger can only ever drag across one boundary — so that
+     * case is simply handed to the pager. Anything longer has to be earned:
+     *
+     * <p>WeChat hangs the ActionBar's title visibility and the tab/fragment
+     * bookkeeping off {@code onPageScrolled}, keyed on the page and offset the
+     * pager reports against the tab index the bar holds. A page the user is
+     * merely passing over is reported with a non-zero offset, and the host
+     * treats those as motion — but when a frame lands <em>exactly</em> on an
+     * intermediate boundary the offset arrives as {@code 0.0f}, which the host
+     * reads as "this page has settled": it moves its own selection onto that
+     * page, resumes that page's fragment and marks it resumed. Two jumps in a
+     * row — the reported 微信↔我 double tap, which crosses two pages each way —
+     * then leave the title view at {@code View.GONE} and the top bar comes back
+     * blank.
+     *
+     * <p>So a longer jump is only animated when the intermediate settles can be
+     * held back from the app's listeners ({@link #holdIntermediateSettles}),
+     * which leaves the app seeing exactly the event sequence a hard cut gives
+     * it while the pages still slide. If that filter cannot be installed the
+     * jump falls back to the app's own hard cut.
      *
      * <p>Hooked once and left in place: the method belongs to the app's class,
      * not to the instance, so re-hooking on every install would stack
@@ -589,10 +596,37 @@ final class TabBarBridge {
                     }
                     int target = (Integer) args[0];
                     int current = currentItem(self);
-                    if (current < 0 || Math.abs(target - current) > 1) {
-                        // More than one page away, or a pager we cannot ask:
-                        // let the app hard-cut, exactly as it would without us.
-                        return chain.proceed();
+                    if (current < 0) {
+                        return chain.proceed(); // a pager we cannot ask
+                    }
+                    int distance = Math.abs(target - current);
+                    if (distance == 0) {
+                        return chain.proceed(); // the pager's own no-op
+                    }
+                    // This call is the live intent: whatever an earlier jump was
+                    // still holding back ends here.
+                    sJumpTarget = -1;
+                    if (distance > 1) {
+                        // Only if the host can be kept from seeing the pages the
+                        // slide passes over; otherwise its own hard cut.
+                        if (!(self instanceof ViewGroup)
+                                || !holdIntermediateSettles((ViewGroup) self)) {
+                            if (!sFilterRefused) {
+                                sFilterRefused = true;
+                                LiquidGlassModule.log(android.util.Log.WARN,
+                                        "no page callbacks to filter on "
+                                                + self.getClass().getName()
+                                                + "; jumps over more than one page"
+                                                + " keep the app's hard cut");
+                            }
+                            return chain.proceed();
+                        }
+                        sJumpTarget = target;
+                        sJumpDeadlineMs = android.os.SystemClock.uptimeMillis()
+                                + JUMP_WINDOW_MS;
+                        LiquidGlassModule.log(android.util.Log.INFO,
+                                "sliding " + current + " -> " + target
+                                        + " with the settled pages held back");
                     }
                     // Re-enters this same hook one level down, where smooth is
                     // now true and the branch above proceeds: that is what
@@ -614,5 +648,186 @@ final class TabBarBridge {
             LiquidGlassModule.log(android.util.Log.WARN,
                     "could not hook the backdrop pager: " + t);
         }
+    }
+
+    /* ---------------- long jump: hold back the intermediate settles -------- */
+
+    /**
+     * Page an in-flight rewritten scroll is heading for, or -1 when none is.
+     *
+     * <p>Only a jump of more than one page ever sets it. A ±1 move is the shape
+     * a drag produces, and the app has always handled that event sequence, so
+     * there is nothing to hold back there.
+     */
+    private static volatile int sJumpTarget = -1;
+    /** Uptime millis after which {@link #sJumpTarget} stops being honoured. */
+    private static volatile long sJumpDeadlineMs;
+
+    /**
+     * How long a rewritten scroll may keep the filter open. The pager caps its
+     * own animation at 600ms and the settle that follows is a frame or two
+     * behind that; this only has to outlast it, and to be short enough that an
+     * interrupted slide cannot leave the filter armed.
+     */
+    private static final long JUMP_WINDOW_MS = 800L;
+
+    /** Listener classes already carrying the filter. */
+    private static final java.util.HashSet<Class<?>> sFilteredListeners =
+            new java.util.HashSet<>();
+    private static boolean sFilterLogged;
+    private static boolean sFilterRefused;
+
+    /**
+     * Keeps the app's page-change listeners from being told that a page the
+     * slide is merely passing over has settled.
+     *
+     * <p>Nothing is added to what the app sees; the filter only withholds the
+     * {@code positionOffset == 0} callback for pages that are not the
+     * destination — the signal the host reads as "this page settled" and acts
+     * on by moving its own tab selection and resuming that page. Everything the
+     * slide animates on (the non-zero offsets that drive the bar's colour
+     * cross-fade) still arrives, and so does the destination's own settle, so
+     * the app's bookkeeping runs exactly as it would after a hard cut while the
+     * pages still slide.
+     *
+     * <p>Found by shape rather than by name: the listeners are whatever the
+     * pager holds in a list field, or in a field that answers the page callback,
+     * so no host class is named here. Anything under {@code android*} /
+     * {@code androidx*} is left alone — that is dispatch plumbing shared with
+     * the rest of the app, and holding a callback back there would reach UI this
+     * module has no business touching.
+     *
+     * @return whether every listener the pager currently has is filtered, i.e.
+     *     whether a long jump can be animated without the app misreading it.
+     */
+    private static boolean holdIntermediateSettles(ViewGroup pager) {
+        java.util.ArrayList<Object> listeners = pageListeners(pager);
+        if (listeners.isEmpty()) {
+            return false;
+        }
+        boolean ready = true;
+        for (int i = 0; i < listeners.size(); i++) {
+            Class<?> cls = listeners.get(i).getClass();
+            if (sFilteredListeners.contains(cls)) {
+                continue;
+            }
+            Method scrolled = pageCallback(cls, "onPageScrolled",
+                    int.class, float.class, int.class);
+            if (scrolled == null) {
+                ready = false;
+                continue;
+            }
+            try {
+                LiquidGlassModule.hookIntercept(scrolled, chain -> {
+                    int target = sJumpTarget;
+                    if (target >= 0) {
+                        if (android.os.SystemClock.uptimeMillis() > sJumpDeadlineMs) {
+                            sJumpTarget = -1;
+                        } else {
+                            Object[] args = chain.getArgs().toArray();
+                            int page = args.length > 0 && args[0] instanceof Integer
+                                    ? (Integer) args[0] : Integer.MIN_VALUE;
+                            float offset = args.length > 1 && args[1] instanceof Float
+                                    ? (Float) args[1] : -1f;
+                            if (offset == 0f) {
+                                if (page != target) {
+                                    return null; // passed over, not settled
+                                }
+                                sJumpTarget = -1; // arrived
+                            }
+                        }
+                    }
+                    return chain.proceed();
+                });
+                Method stateChanged = pageCallback(cls,
+                        "onPageScrollStateChanged", int.class);
+                if (stateChanged != null) {
+                    LiquidGlassModule.hookIntercept(stateChanged, chain -> {
+                        Object[] args = chain.getArgs().toArray();
+                        if (args.length > 0 && args[0] instanceof Integer
+                                && (Integer) args[0] == 1) {
+                            // DRAGGING: a finger took over, so the jump is over
+                            // and its destination will never be reported.
+                            sJumpTarget = -1;
+                        }
+                        return chain.proceed();
+                    });
+                }
+                sFilteredListeners.add(cls);
+                if (!sFilterLogged) {
+                    sFilterLogged = true;
+                    LiquidGlassModule.log(android.util.Log.INFO,
+                            "page callbacks filtered on " + cls.getName()
+                                    + "; long tab jumps will slide");
+                }
+            } catch (Throwable t) {
+                LiquidGlassModule.logErr("could not filter page callbacks", t);
+                ready = false;
+            }
+        }
+        return ready;
+    }
+
+    /** The pager's page-change listeners, found by shape and never by name. */
+    private static java.util.ArrayList<Object> pageListeners(ViewGroup pager) {
+        java.util.ArrayList<Object> found = new java.util.ArrayList<>(2);
+        for (Class<?> k = pager.getClass(); k != null && k != Object.class;
+                k = k.getSuperclass()) {
+            java.lang.reflect.Field[] fields;
+            try {
+                fields = k.getDeclaredFields();
+            } catch (Throwable t) {
+                continue;
+            }
+            for (java.lang.reflect.Field f : fields) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                Object value;
+                try {
+                    f.setAccessible(true);
+                    value = f.get(pager);
+                } catch (Throwable t) {
+                    continue;
+                }
+                if (value instanceof java.util.List) {
+                    try {
+                        for (Object item : (java.util.List<?>) value) {
+                            if (isPageListener(item)) {
+                                found.add(item);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                        // A list the app mutates under us is not the one holding
+                        // the listeners; another field will answer.
+                    }
+                } else if (isPageListener(value)) {
+                    found.add(value);
+                }
+            }
+        }
+        return found;
+    }
+
+    private static boolean isPageListener(Object o) {
+        return o != null
+                && !o.getClass().getName().startsWith("android")
+                && pageCallback(o.getClass(), "onPageScrolled",
+                        int.class, float.class, int.class) != null;
+    }
+
+    /** The callback as declared on {@code cls} or on an app base of it. */
+    private static Method pageCallback(Class<?> cls, String name, Class<?>... params) {
+        for (Class<?> k = cls; k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("android")) {
+                return null;
+            }
+            try {
+                return k.getDeclaredMethod(name, params);
+            } catch (NoSuchMethodException ignored) {
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 }
