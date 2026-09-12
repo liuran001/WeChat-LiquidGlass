@@ -74,6 +74,9 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
     private long mLastFrameNs;
     private boolean mFrameScheduled;
 
+    /** Scratch for {@link #originInHost}; every use is on the UI thread. */
+    private final int[] mPos = new int[2];
+
     /** Velocity is tracked over the value (tab units), as KernelSU does. */
     private long mLastSampleMs;
     private float mLastSampleValue;
@@ -378,8 +381,7 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         }
         ViewGroup.LayoutParams lp = droplet.getLayoutParams();
         float dropletW = lp != null && lp.width > 0 ? lp.width : droplet.getWidth();
-        float originX = tabRow.getLeft() + first.getLeft()
-                + (first.getWidth() - dropletW) * 0.5f;
+        float originX = originInHost(tabRow, first, dropletW);
         droplet.setTranslationX(originX + mValue.value() * tabWidth);
 
         // KernelSU:
@@ -441,6 +443,27 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 tab.setScaleY(1f);
             }
         }
+    }
+
+    /**
+     * Resting x of the first tab column, expressed as a translation for a
+     * droplet that is laid out at the host's padding origin.
+     *
+     * <p>Measured through the tree rather than from the row's own {@code
+     * getLeft()}: on QQ the row <em>is</em> the bar view, so that left already
+     * includes the host's shadow padding, and adding it to a position that
+     * starts at the host's padding counted the padding twice — the droplet rode
+     * one padding to the right of its tab, outside the pill.
+     */
+    private float originInHost(ViewGroup tabRow, View first, float dropletW) {
+        float centre = (first.getWidth() - dropletW) * 0.5f;
+        View host = mHostRef.get();
+        if (host instanceof ViewGroup
+                && ViewGeom.positionIn(tabRow, host, mPos)) {
+            return mPos[0] + first.getLeft() + centre
+                    - ((ViewGroup) host).getPaddingLeft();
+        }
+        return tabRow.getLeft() + first.getLeft() + centre;
     }
 
     private static float tabWidth(ViewGroup tabRow) {

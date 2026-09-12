@@ -45,6 +45,42 @@ final class ViewGeom {
     }
 
     /**
+     * Top-left of {@code v} in {@code ancestor}'s own coordinates, layout
+     * offsets only — no scale, no screen origin.
+     *
+     * <p>This is the form the bar's own children need. Reading a single
+     * {@code getTop()} is only correct while the two views are parent and
+     * child; the host's shadow padding lives on the host, so a view one level
+     * down (QQ's tab widget, which doubles as its own tab row) reports an
+     * offset that already contains it. Summing every step to the host and
+     * subtracting the host's padding then gives the position exactly once,
+     * whichever shape the app's tree has this release.
+     *
+     * @return false when {@code v} is not a descendant of {@code ancestor},
+     *     so callers can fall back instead of trusting a half-filled array.
+     */
+    static boolean positionIn(View v, View ancestor, int[] out) {
+        if (v == null || ancestor == null) {
+            return false;
+        }
+        float x = 0f;
+        float y = 0f;
+        View cur = v;
+        while (cur != null && cur != ancestor) {
+            x += cur.getLeft();
+            y += cur.getTop();
+            ViewParent p = cur.getParent();
+            cur = p instanceof View ? (View) p : null;
+        }
+        if (cur != ancestor) {
+            return false;
+        }
+        out[0] = Math.round(x);
+        out[1] = Math.round(y);
+        return true;
+    }
+
+    /**
      * Scale this view is actually drawn at, including every ancestor's.
      *
      * <p>A view's own {@code getScaleX()} is not enough once the bar grows as a

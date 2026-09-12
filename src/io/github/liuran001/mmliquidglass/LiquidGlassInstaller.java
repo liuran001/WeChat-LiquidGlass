@@ -41,6 +41,8 @@ final class LiquidGlassInstaller {
 
     /** Scratch for on-screen positions; every use is on the UI thread. */
     private static final int[] sLoc = new int[2];
+    /** Scratch for host-relative positions; every use is on the UI thread. */
+    private static final int[] sPos = new int[2];
     private static boolean sKeepFailed;
     private static WeakReference<Activity> sActivityRef = new WeakReference<>(null);
     private static WeakReference<LiquidGlassHostLayout> sHostRef = new WeakReference<>(null);
@@ -54,6 +56,8 @@ final class LiquidGlassInstaller {
     /** Identity/children fingerprint of the row the renderer is currently bound to. */
     private static int sTabStructureSignature;
     private static boolean sTabStructureRefreshPosted;
+    /** Frames the live tab row has been unusable while the old binding is dead. */
+    private static int sTabRowEmptyFrames;
     /** Content height established during install, before QQ's navigation reserve. */
     private static int sBarHeight;
     /**
@@ -70,6 +74,9 @@ final class LiquidGlassInstaller {
     private static boolean sBlurRelit;
     /** Droplet's resting Y inside the host, before WeChat's bar offset. */
     private static float sDropletBaseY;
+    /** Geometry the droplet's size and offset were last computed against. */
+    private static int sDropletGeometryKey;
+    private static boolean sDropletLogged;
 
     private LiquidGlassInstaller() {
     }
@@ -199,6 +206,7 @@ final class LiquidGlassInstaller {
         sDrag = null;
         sTabStructureSignature = 0;
         sTabStructureRefreshPosted = false;
+        sTabRowEmptyFrames = 0;
         sBarHeight = 0;
         sBlurLayerRef = new WeakReference<>(null);
         sHairlineRef = new WeakReference<>(null);
@@ -206,6 +214,11 @@ final class LiquidGlassInstaller {
         sBlurRelit = false;
         sLastIndex = -1;
         sDropletBaseY = 0f;
+        sDropletGeometryKey = 0;
+        sDropletLogged = false;
+        sPaddedScrollers.clear();
+        sScrollerPad = 0;
+        sPageBarDisagreement = 0;
         LiquidGlassModule.log(android.util.Log.INFO,
                 "stale host from a previous Activity dropped, reinstalling");
     }
@@ -759,6 +772,53 @@ final class LiquidGlassInstaller {
     }
 
     /**
+     * Room the scrollers were last padded with, and the scrollers themselves.
+     *
+     * <p>Kept so the per-frame path can re-assert padding and clipping without
+     * walking the tree again: the apps restore their own view state on layout
+     * passes of their own, and a scroller that has quietly gone back to
+     * {@code clipToPadding=true} paints its padding band as an opaque strip —
+     * the white block that appears over the content partway through a scroll.
+     */
+    private static final java.util.ArrayList<WeakReference<ViewGroup>> sPaddedScrollers =
+            new java.util.ArrayList<>();
+    private static int sScrollerPad;
+    private static final int MAX_TRACKED_SCROLLERS = 16;
+
+    /** Re-asserts the scroll padding and the clipping flag on every frame. */
+    private static void maintainScrollerPadding() {
+        int pad = sScrollerPad;
+        if (pad <= 0) {
+            return;
+        }
+        for (int i = 0; i < sPaddedScrollers.size(); i++) {
+            ViewGroup v = sPaddedScrollers.get(i).get();
+            if (v == null) {
+                continue;
+            }
+            if (v.getClipToPadding()) {
+                v.setClipToPadding(false);
+            }
+            if (v.getPaddingBottom() != pad) {
+                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
+                        v.getPaddingRight(), pad);
+            }
+        }
+    }
+
+    private static void trackPaddedScroller(ViewGroup scroller) {
+        for (int i = 0; i < sPaddedScrollers.size(); i++) {
+            if (sPaddedScrollers.get(i).get() == scroller) {
+                return;
+            }
+        }
+        if (sPaddedScrollers.size() >= MAX_TRACKED_SCROLLERS) {
+            sPaddedScrollers.remove(0);
+        }
+        sPaddedScrollers.add(new WeakReference<>(scroller));
+    }
+
+    /**
      * Gives every scrolling view in the subtree room to scroll its last row clear
      * of the floating pill, with {@code clipToPadding=false} so rows still render
      * through the padded band — i.e. behind and below the pill.
@@ -798,6 +858,10 @@ final class LiquidGlassInstaller {
                 if (sv.getPaddingBottom() != pad) {
                     sv.setPadding(sv.getPaddingLeft(), sv.getPaddingTop(),
                             sv.getPaddingRight(), pad);
+                }
+                if (pad > 0) {
+                    sScrollerPad = pad;
+                    trackPaddedScroller(sv);
                 }
             } else if (c instanceof ViewGroup) {
                 padScrollersBottom((ViewGroup) c, pad, depth + 1);
@@ -1387,9 +1451,21 @@ final class LiquidGlassInstaller {
         if (current == null || current.getVisibility() != View.VISIBLE
                 || TabBarBridge.tabCount(current) == 0) {
             // QQ briefly detaches/empties Material's indicator while applying
-            // the setting. Keep the old binding untouched and retry next frame.
-            return sTabRowRef.get() != null;
+            // the setting. Keep the old binding untouched and retry next frame
+            // — but not indefinitely: a row that never comes back would
+            // otherwise hold this method's `true` forever, and with it the
+            // selection watcher and the droplet.
+            ViewGroup bound = sTabRowRef.get();
+            boolean boundUsable = bound != null && bound.isAttachedToWindow()
+                    && bound.getVisibility() == View.VISIBLE
+                    && TabBarBridge.tabCount(bound) > 0;
+            if (boundUsable) {
+                sTabRowEmptyFrames = 0;
+                return true;
+            }
+            return ++sTabRowEmptyFrames < 120;
         }
+        sTabRowEmptyFrames = 0;
         if (sTabStructureRefreshPosted) {
             return true;
         }
@@ -1523,8 +1599,15 @@ final class LiquidGlassInstaller {
                 if (scheduleTabStructureRefreshIfNeeded(host)) {
                     return true;
                 }
+                // Kept honest per frame: both apps undo parts of the page
+                // surgery on layout passes of their own, and a scroller that
+                // has gone back to clipping its padding paints an opaque band
+                // over the content it is scrolling.
+                maintainScrollerPadding();
+                maintainPageExtent();
+                maintainDropletGeometry();
                 ViewGroup tabRow = sTabRowRef.get();
-                int sel = TabBarBridge.selectedIndex(tabRow);
+                int sel = visibleTabSelection(tabRow);
                 if (sel >= 0 && sel != sLastIndex) {
                     boolean first = sLastIndex < 0;
                     sLastIndex = sel;
@@ -1542,6 +1625,76 @@ final class LiquidGlassInstaller {
             } catch (Throwable ignored) {
             }
             return true;
+        });
+    }
+
+    /**
+     * Frames a page/bar disagreement has to survive before the page is believed.
+     * A quarter of a second at 60Hz: long enough that the ordinary lag between a
+     * page scroll and the bar's own selection never reaches it.
+     */
+    private static final int PAGE_BAR_SETTLE_FRAMES = 15;
+    private static int sPageBarDisagreement;
+    private static boolean sPageWonLogged;
+
+    /**
+     * Selected slot, with the page actually on screen given the last word.
+     *
+     * <p>Both apps occasionally leave the bar behind the pager. The reported
+     * case is WeChat's wallet: coming back from it the pager is on the chat
+     * list while the tab views still hold 我, so a droplet that only ever reads
+     * the bar highlights a page nobody is looking at (#9). The page wins, but
+     * only once the disagreement has held for several frames, so a bar that is
+     * merely a step behind still drives the animation.
+     */
+    private static int visibleTabSelection(ViewGroup tabRow) {
+        int selected = TabBarBridge.selectedIndex(tabRow);
+        int page = TabBarBridge.pageSlot(sPagerRef.get(), tabRow);
+        if (page < 0 || page == selected) {
+            sPageBarDisagreement = 0;
+            return selected;
+        }
+        if (++sPageBarDisagreement < PAGE_BAR_SETTLE_FRAMES) {
+            return selected;
+        }
+        if (!sPageWonLogged) {
+            sPageWonLogged = true;
+            LiquidGlassModule.log(android.util.Log.INFO,
+                    "bar still reports tab " + selected + " while page " + page
+                            + " is on screen; following the page");
+        }
+        return page;
+    }
+
+    /** Slow tick that re-runs the page stretch; see {@link #maintainPageExtent}. */
+    private static int sExtentTick;
+
+    /**
+     * Re-runs the page stretch on a slow timer.
+     *
+     * <p>The apps re-apply their own page metrics whenever they relayout, and
+     * they do it silently — no layout change on any view we listen to. When
+     * that happens the pages stop short again and the band the bar vacated
+     * shows the window's own background: the white strip under the pill, and
+     * the grey-and-white patchwork at the end of a scrolled list (#6).
+     *
+     * <p>Cheap by construction: every step inside {@link #extendPagesToBottom}
+     * bails out on its own when its gap is already closed, so this only ever
+     * costs a comparison — until something really did move, and then it repairs
+     * it within half a second instead of waiting for the next tab switch.
+     */
+    private static void maintainPageExtent() {
+        ViewGroup pager = sPagerRef.get();
+        if (pager == null || !pager.isAttachedToWindow()) {
+            return;
+        }
+        if ((++sExtentTick % 30) != 0) {
+            return;
+        }
+        pager.post(() -> {
+            if (sPagerRef.get() == pager) {
+                extendPagesToBottom(pager);
+            }
         });
     }
 
@@ -2144,6 +2297,14 @@ final class LiquidGlassInstaller {
     /**
      * Sizes and vertically places the droplet for the given tab. Horizontal
      * position and all motion belong to {@link DropletDragController}'s springs.
+     *
+     * <p>Everything is measured against the host, whose children start at its
+     * shadow padding. Reading one level of {@code getTop()} only works while
+     * the tab row sits <em>inside</em> the bar; QQ's row <em>is</em> the bar, so
+     * the same expression counted that padding twice and dropped the droplet
+     * 14dp below — and, through the drag controller's twin expression, 14dp
+     * right of — the tab it belongs to, visibly outside the pill. Walking the
+     * parents and subtracting the padding is correct for both shapes.
      */
     private static void syncDropletSize(int index) {
         try {
@@ -2157,14 +2318,33 @@ final class LiquidGlassInstaller {
             if (tab == null || tab.getWidth() == 0) {
                 return;
             }
+            // The pill's inner box. Everything outside it is our own shadow
+            // padding, which the droplet must neither include nor overhang.
+            int pillTop = host.getPaddingTop();
+            int pillBottom = host.getHeight() - host.getPaddingBottom();
+            if (pillBottom <= pillTop || !ViewGeom.positionIn(tab, host, sPos)) {
+                return;
+            }
             float density = host.getResources().getDisplayMetrics().density;
             // KernelSU sizes the droplet to the full tab column: width = tabWidth,
             // height = bar height - 2 * 4dp padding.
             int inset = Math.round(density * 4f);
             int w = tab.getWidth();
-            int h = tab.getHeight() - inset * 2;
+            // The column can measure taller than the pill — QQ lays its tabs out
+            // at the old docked height and lets the bar clip them — so the
+            // droplet is held inside the pill rather than hanging out of its
+            // bottom edge.
+            int slot = Math.min(tab.getHeight(), pillBottom - pillTop);
+            int h = slot - inset * 2;
             if (w <= 0 || h <= 0) {
                 return;
+            }
+            int top = sPos[1] + inset;
+            if (top + h > pillBottom) {
+                top = pillBottom - h;
+            }
+            if (top < pillTop) {
+                top = pillTop;
             }
             ViewGroup.LayoutParams lp = droplet.getLayoutParams();
             if (lp.width != w || lp.height != h) {
@@ -2172,11 +2352,59 @@ final class LiquidGlassInstaller {
                 lp.height = h;
                 droplet.setLayoutParams(lp);
             }
-            sDropletBaseY = tab.getTop() + tabRow.getTop() + inset;
+            sDropletBaseY = top - pillTop;
             droplet.setTranslationY(sDropletBaseY);
             droplet.setVisibility(View.VISIBLE);
+            sDropletGeometryKey = dropletGeometryKey(host, tab);
+            if (!sDropletLogged) {
+                sDropletLogged = true;
+                LiquidGlassModule.log(android.util.Log.INFO,
+                        "droplet placed: tab=" + sPos[0] + "," + sPos[1]
+                                + " size=" + w + "x" + h
+                                + " pill=" + pillTop + ".." + pillBottom
+                                + " hostPad=" + host.getPaddingLeft()
+                                + "," + host.getPaddingTop()
+                                + " tabH=" + tab.getHeight());
+            }
         } catch (Throwable t) {
             LiquidGlassModule.logErr("droplet sizing failed", t);
         }
+    }
+
+    /** Fingerprint of the bar geometry the droplet was last sized against. */
+    private static int dropletGeometryKey(LiquidGlassHostLayout host, View tab) {
+        int key = tab.getWidth();
+        key = key * 131 + tab.getHeight();
+        key = key * 131 + sPos[1];
+        key = key * 131 + host.getHeight();
+        return key;
+    }
+
+    /**
+     * Re-places the droplet when the bar's own geometry moved under it.
+     *
+     * <p>Both apps rebuild parts of the bar on their own schedule — QQ restores
+     * its docked tab heights, WeChat re-applies page metrics — and none of that
+     * announces itself as a selection change. Without this the droplet keeps a
+     * size and offset measured against the old bar until the next tab switch,
+     * which is exactly the "glass sitting outside the bar" state.
+     */
+    private static void maintainDropletGeometry() {
+        if (sLastIndex < 0 || sDropletRef.get() == null) {
+            return;
+        }
+        ViewGroup tabRow = sTabRowRef.get();
+        LiquidGlassHostLayout host = sHostRef.get();
+        if (tabRow == null || host == null) {
+            return;
+        }
+        View tab = TabBarBridge.tabAt(tabRow, sLastIndex);
+        if (tab == null || !ViewGeom.positionIn(tab, host, sPos)) {
+            return;
+        }
+        if (dropletGeometryKey(host, tab) == sDropletGeometryKey) {
+            return;
+        }
+        syncDropletSize(sLastIndex);
     }
 }

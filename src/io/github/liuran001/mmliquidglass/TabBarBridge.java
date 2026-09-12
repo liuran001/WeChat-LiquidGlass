@@ -457,6 +457,58 @@ final class TabBarBridge {
     private static volatile boolean sHookedPager;
 
     /**
+     * Slot whose page the backdrop pager is actually showing, or -1 when that
+     * cannot be established.
+     *
+     * <p>Asked reflectively because the two hosts ship different pagers —
+     * WeChat's own {@code ViewPager} subclass, QQ's {@code ViewPager2} — and
+     * {@code getCurrentItem()} is the one accessor both carry.
+     *
+     * <p>Only a row in which every child takes part in the layout is trusted. A
+     * GONE tab shifts every later page by one, and following the page is not
+     * worth putting the droplet on the wrong tab for.
+     */
+    static int pageSlot(ViewGroup pager, ViewGroup tabRow) {
+        if (pager == null || tabRow == null
+                || tabCount(tabRow) != tabRow.getChildCount()) {
+            return -1;
+        }
+        Method getter = pageGetter(pager.getClass());
+        if (getter == null) {
+            return -1;
+        }
+        try {
+            Object value = getter.invoke(pager);
+            if (value instanceof Integer) {
+                int index = (Integer) value;
+                return tabAt(tabRow, index) != null ? index : -1;
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    /** Pager class → its page getter; the caller runs on every frame. */
+    private static Class<?> sPageGetterClass;
+    private static Method sPageGetter;
+
+    private static Method pageGetter(Class<?> pagerClass) {
+        if (pagerClass == sPageGetterClass) {
+            return sPageGetter;
+        }
+        Method found = null;
+        try {
+            found = pagerClass.getMethod("getCurrentItem");
+        } catch (Throwable ignored) {
+            // A backdrop that is not a pager at all: remembered as an answer of
+            // its own, so the lookup happens once rather than per frame.
+        }
+        sPageGetter = found;
+        sPageGetterClass = pagerClass;
+        return found;
+    }
+
+    /**
      * Restores the page transition both hosts throw away on a tab tap.
      *
      * <p>Neither app animates the swap itself: the bar handler calls
