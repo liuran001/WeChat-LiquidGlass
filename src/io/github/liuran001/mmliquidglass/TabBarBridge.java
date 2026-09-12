@@ -473,6 +473,15 @@ final class TabBarBridge {
                 || tabCount(tabRow) != tabRow.getChildCount()) {
             return -1;
         }
+        int index = currentItem(pager);
+        return index >= 0 && tabAt(tabRow, index) != null ? index : -1;
+    }
+
+    /** The pager's current page, or -1 when it is not a pager we can ask. */
+    static int currentItem(Object pager) {
+        if (pager == null) {
+            return -1;
+        }
         Method getter = pageGetter(pager.getClass());
         if (getter == null) {
             return -1;
@@ -480,21 +489,25 @@ final class TabBarBridge {
         try {
             Object value = getter.invoke(pager);
             if (value instanceof Integer) {
-                int index = (Integer) value;
-                return tabAt(tabRow, index) != null ? index : -1;
+                return (Integer) value;
             }
         } catch (Throwable ignored) {
         }
         return -1;
     }
 
-    /** Pager class → its page getter; the caller runs on every frame. */
-    private static Class<?> sPageGetterClass;
-    private static Method sPageGetter;
+    /** Pager class → its page getter; the callers run on every frame. */
+    private static final java.util.HashMap<Class<?>, Method> sPageGetters =
+            new java.util.HashMap<>();
+    private static final java.util.HashSet<Class<?>> sNotAPager = new java.util.HashSet<>();
 
     private static Method pageGetter(Class<?> pagerClass) {
-        if (pagerClass == sPageGetterClass) {
-            return sPageGetter;
+        Method cached = sPageGetters.get(pagerClass);
+        if (cached != null) {
+            return cached;
+        }
+        if (sNotAPager.contains(pagerClass)) {
+            return null;
         }
         Method found = null;
         try {
@@ -503,8 +516,11 @@ final class TabBarBridge {
             // A backdrop that is not a pager at all: remembered as an answer of
             // its own, so the lookup happens once rather than per frame.
         }
-        sPageGetter = found;
-        sPageGetterClass = pagerClass;
+        if (found == null) {
+            sNotAPager.add(pagerClass);
+        } else {
+            sPageGetters.put(pagerClass, found);
+        }
         return found;
     }
 
@@ -515,6 +531,21 @@ final class TabBarBridge {
      * {@code setCurrentItem(index, false)} and the pages hard-cut. Rewriting
      * that one flag to true hands the slide back to the pager, which is the
      * motion the droplet was already animating alongside.
+     *
+     * <p>Only a <em>one-page</em> move is rewritten, because that is the only
+     * shape the hosts' own page-change handling was written for. A finger can
+     * only ever drag across one boundary, so everything hanging off
+     * {@code onPageScrolled} sees adjacent pages and nothing else — on WeChat
+     * that includes the ActionBar's title visibility, which
+     * {@code MainTabUI}/{@code HomeUI} drive from the current tab index held
+     * against the page and offset the pager reports. An animated jump across
+     * several pages walks the intermediate ones, and when a frame lands exactly
+     * on one of those boundaries the offset arrives as {@code 0.0f} for a page
+     * the user is not on, which the host reads as "this page has settled" and
+     * acts on. With two such jumps back to back — the reported 微信↔我 double
+     * tap — the title can be left at {@code View.GONE} and the top bar comes
+     * back blank. A ±1 move stays inside what a drag produces, so the slide is
+     * kept there and longer jumps keep the app's own hard cut.
      *
      * <p>Hooked once and left in place: the method belongs to the app's class,
      * not to the instance, so re-hooking on every install would stack
@@ -544,22 +575,30 @@ final class TabBarBridge {
                     // instant jump is what the app asked for, and turning it
                     // into a scroll animates UI this module has no business
                     // touching.
-                    if (chain.getThisObject() != LiquidGlassInstaller.currentPager()) {
+                    Object self = chain.getThisObject();
+                    if (self != LiquidGlassInstaller.currentPager()) {
                         return chain.proceed();
                     }
                     Object[] args = chain.getArgs().toArray();
-                    boolean smooth = false;
-                    if (args.length >= 2 && args[1] instanceof Boolean) {
-                        smooth = (Boolean) args[1];
+                    if (args.length >= 2 && args[1] instanceof Boolean
+                            && (Boolean) args[1]) {
+                        return chain.proceed(); // already a slide
                     }
-                    if (!smooth) {
-                        // Re-enters this same hook one level down, where smooth
-                        // is now true and the branch below proceeds: that is
-                        // what stops it recursing.
-                        setItemSmooth.invoke(chain.getThisObject(), args[0], true);
-                        return null; // swallow the original hard-cut call
+                    if (args.length < 1 || !(args[0] instanceof Integer)) {
+                        return chain.proceed();
                     }
-                    return chain.proceed(); // allow smooth calls through
+                    int target = (Integer) args[0];
+                    int current = currentItem(self);
+                    if (current < 0 || Math.abs(target - current) > 1) {
+                        // More than one page away, or a pager we cannot ask:
+                        // let the app hard-cut, exactly as it would without us.
+                        return chain.proceed();
+                    }
+                    // Re-enters this same hook one level down, where smooth is
+                    // now true and the branch above proceeds: that is what
+                    // stops it recursing.
+                    setItemSmooth.invoke(self, args[0], true);
+                    return null; // swallow the original hard-cut call
                 });
                 sHookedPager = true;
                 LiquidGlassModule.log(android.util.Log.INFO,
