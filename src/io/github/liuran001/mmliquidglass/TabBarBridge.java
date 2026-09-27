@@ -5,6 +5,8 @@ import android.view.ViewGroup;
 import android.widget.LinearLayout;
 
 import java.lang.reflect.Method;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Bridge to the host app's own bottom tab bar.
@@ -39,6 +41,7 @@ final class TabBarBridge {
             return;
         }
         int hooked = 0;
+        Set<Method> bound = new HashSet<>();
         for (String className : app.tabViewClasses) {
             Class<?> cls;
             try {
@@ -52,20 +55,27 @@ final class TabBarBridge {
             }
             for (String methodName : app.tabSwitchMethods) {
                 try {
-                    // Declared, not inherited: QQ's bar extends the framework's
-                    // TabWidget, and hooking that method on the base class would
-                    // reach every TabWidget in the process.
-                    Method m = cls.getDeclaredMethod(methodName, int.class);
+                    Method m = switchMethod(cls, methodName);
+                    // An inherited method is bound on the class declaring it,
+                    // so it reaches every instance of that class — for QQ's
+                    // bar, every TabWidget in the process. Only the bar itself
+                    // is let through then.
+                    boolean shared = m.getDeclaringClass() != cls;
+                    if (!bound.add(m)) {
+                        continue; // a second bar class inheriting the same one
+                    }
                     LiquidGlassModule.hookAfter(m, chain -> {
                         Object thiz = chain.getThisObject();
                         Object arg0 = chain.getArg(0);
-                        if (thiz instanceof View && arg0 instanceof Integer) {
+                        if (thiz instanceof View && arg0 instanceof Integer
+                                && (!shared || isTabView((View) thiz))) {
                             LiquidGlassInstaller.onTabChanged((View) thiz, (Integer) arg0);
                         }
                     });
                     hooked++;
                     LiquidGlassModule.log(android.util.Log.INFO,
-                            "hooked " + className + "." + methodName + "(int)");
+                            "hooked " + className + "." + methodName + "(int)"
+                                    + (shared ? " via " + m.getDeclaringClass().getName() : ""));
                 } catch (Throwable t) {
                     LiquidGlassModule.log(android.util.Log.WARN,
                             "no " + methodName + "(int) on " + className + ": " + t);
@@ -77,6 +87,25 @@ final class TabBarBridge {
             LiquidGlassModule.log(android.util.Log.WARN,
                     "tab bar bridge unavailable for " + app + " (layout changed?);"
                             + " falling back to polling alone");
+        }
+    }
+
+    /**
+     * The bar's own tab-switch method, or the one it inherits if it has none.
+     *
+     * <p>The bar's own copy is preferred because a hook on it reaches that class
+     * alone. QQ's {@code QQTabWidget} carries a pass-through override in 9.3.55
+     * to 9.3.70, but the Google Play build 8.2.11 declares none and runs
+     * {@code android.widget.TabWidget}'s as is. Asking for the declared method
+     * only left that build with nothing hooked, so the bar was found by the
+     * resume polling or not at all.
+     */
+    private static Method switchMethod(Class<?> cls, String name)
+            throws NoSuchMethodException {
+        try {
+            return cls.getDeclaredMethod(name, int.class);
+        } catch (NoSuchMethodException e) {
+            return cls.getMethod(name, int.class);
         }
     }
 

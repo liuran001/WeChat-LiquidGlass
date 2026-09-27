@@ -48,6 +48,13 @@ final class HostApp {
      * child of the same {@code DragFrameLayout}, over a full-screen content
      * view, and both take {@code setCurrentTab(int)} on every switch.
      *
+     * <p>Rechecked against 9.3.55, 9.3.60 and 9.3.70: same classes, same
+     * switch. The flag only applies to phones — {@code AppSetting.s()} keeps
+     * tablets and unfolded foldables on {@code QQTabWidget} whatever the server
+     * says. The Google Play build 8.2.11 ships {@code QQTabWidget} alone, and
+     * without its own {@code setCurrentTab} (see
+     * {@code TabBarBridge.switchMethod}).
+     *
      * <p>{@code QQBlurViewWrapper} is QQ's own 54dp frosted strip behind the
      * bar. Left visible it would sit between the glass and the page it is
      * supposed to refract, so it is hidden on install.
