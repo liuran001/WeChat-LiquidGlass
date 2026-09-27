@@ -56,8 +56,13 @@ final class LiquidGlassInstaller {
     /** Identity/children fingerprint of the row the renderer is currently bound to. */
     private static int sTabStructureSignature;
     private static boolean sTabStructureRefreshPosted;
-    /** Frames the live tab row has been unusable while the old binding is dead. */
-    private static int sTabRowEmptyFrames;
+    /**
+     * Uptime since which the live tab row has been unusable while the old
+     * binding is dead too, or 0. Timed rather than counted in frames: with
+     * nothing moving no frames come, and the wait would never run out.
+     */
+    private static long sTabRowEmptySinceMs;
+    private static final long TAB_ROW_EMPTY_GIVE_UP_MS = 2000L;
     /** Content height established during install, before QQ's navigation reserve. */
     private static int sBarHeight;
     /**
@@ -206,7 +211,7 @@ final class LiquidGlassInstaller {
         sDrag = null;
         sTabStructureSignature = 0;
         sTabStructureRefreshPosted = false;
-        sTabRowEmptyFrames = 0;
+        sTabRowEmptySinceMs = 0L;
         sBarHeight = 0;
         sBlurLayerRef = new WeakReference<>(null);
         sHairlineRef = new WeakReference<>(null);
@@ -218,7 +223,7 @@ final class LiquidGlassInstaller {
         sDropletLogged = false;
         sPaddedScrollers.clear();
         sScrollerPad = 0;
-        sPageBarDisagreement = 0;
+        sPageBarDisagreeSinceMs = 0L;
         LiquidGlassModule.log(android.util.Log.INFO,
                 "stale host from a previous Activity dropped, reinstalling");
     }
@@ -682,7 +687,10 @@ final class LiquidGlassInstaller {
         if (host == null || host.getHeight() <= 0) {
             return 0;
         }
-        host.getLocationOnScreen(sLoc);
+        // Unscaled: the pill grows while held and eases in on reveal, and a
+        // stretch that ran mid-way through either used to hand the lists a
+        // padding they had to relayout for, twice.
+        ViewGeom.unscaledScreenPos(host, sLoc);
         // Undo the offset followBarOffset applies while the bar slides away.
         float pillTop = sLoc[1] - host.getTranslationY() + host.getPaddingTop();
         View root = host.getRootView();
@@ -1460,12 +1468,16 @@ final class LiquidGlassInstaller {
                     && bound.getVisibility() == View.VISIBLE
                     && TabBarBridge.tabCount(bound) > 0;
             if (boundUsable) {
-                sTabRowEmptyFrames = 0;
+                sTabRowEmptySinceMs = 0L;
                 return true;
             }
-            return ++sTabRowEmptyFrames < 120;
+            long now = android.os.SystemClock.uptimeMillis();
+            if (sTabRowEmptySinceMs == 0L) {
+                sTabRowEmptySinceMs = now;
+            }
+            return now - sTabRowEmptySinceMs < TAB_ROW_EMPTY_GIVE_UP_MS;
         }
-        sTabRowEmptyFrames = 0;
+        sTabRowEmptySinceMs = 0L;
         if (sTabStructureRefreshPosted) {
             return true;
         }
@@ -1604,7 +1616,7 @@ final class LiquidGlassInstaller {
                 // has gone back to clipping its padding paints an opaque band
                 // over the content it is scrolling.
                 maintainScrollerPadding();
-                maintainPageExtent();
+                sPageExtent.request();
                 maintainDropletGeometry();
                 ViewGroup tabRow = sTabRowRef.get();
                 int sel = visibleTabSelection(tabRow);
@@ -1629,13 +1641,21 @@ final class LiquidGlassInstaller {
     }
 
     /**
-     * Frames a page/bar disagreement has to survive before the page is believed.
-     * A quarter of a second at 60Hz: long enough that the ordinary lag between a
-     * page scroll and the bar's own selection never reaches it.
+     * How long a page/bar disagreement has to last before the page is believed:
+     * long enough that the ordinary lag between a page scroll and the bar's own
+     * selection never reaches it.
      */
-    private static final int PAGE_BAR_SETTLE_FRAMES = 15;
-    private static int sPageBarDisagreement;
+    private static final long PAGE_BAR_SETTLE_MS = 250L;
+    /** Uptime at which the current disagreement began, or 0 while they agree. */
+    private static long sPageBarDisagreeSinceMs;
     private static boolean sPageWonLogged;
+    /** Draws the frame that settles a disagreement, in case nothing else would. */
+    private static final Runnable sPageBarSettle = () -> {
+        LiquidGlassHostLayout host = sHostRef.get();
+        if (host != null && sPageBarDisagreeSinceMs != 0L) {
+            host.invalidate();
+        }
+    };
 
     /**
      * Selected slot, with the page actually on screen given the last word.
@@ -1644,17 +1664,32 @@ final class LiquidGlassInstaller {
      * case is WeChat's wallet: coming back from it the pager is on the chat
      * list while the tab views still hold 我, so a droplet that only ever reads
      * the bar highlights a page nobody is looking at (#9). The page wins, but
-     * only once the disagreement has held for several frames, so a bar that is
-     * merely a step behind still drives the animation.
+     * only once the disagreement has held for a while, so a bar that is merely
+     * a step behind still drives the animation.
+     *
+     * <p>Timed on the clock, not counted in frames: frames stop coming once the
+     * screen settles, and the wallet case settles right there.
      */
     private static int visibleTabSelection(ViewGroup tabRow) {
         int selected = TabBarBridge.selectedIndex(tabRow);
         int page = TabBarBridge.pageSlot(sPagerRef.get(), tabRow);
+        LiquidGlassHostLayout host = sHostRef.get();
         if (page < 0 || page == selected) {
-            sPageBarDisagreement = 0;
+            if (sPageBarDisagreeSinceMs != 0L && host != null) {
+                host.removeCallbacks(sPageBarSettle);
+            }
+            sPageBarDisagreeSinceMs = 0L;
             return selected;
         }
-        if (++sPageBarDisagreement < PAGE_BAR_SETTLE_FRAMES) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (sPageBarDisagreeSinceMs == 0L) {
+            sPageBarDisagreeSinceMs = now;
+            if (host != null) {
+                host.postDelayed(sPageBarSettle, PAGE_BAR_SETTLE_MS + 16L);
+            }
+            return selected;
+        }
+        if (now - sPageBarDisagreeSinceMs < PAGE_BAR_SETTLE_MS) {
             return selected;
         }
         if (!sPageWonLogged) {
@@ -1666,11 +1701,8 @@ final class LiquidGlassInstaller {
         return page;
     }
 
-    /** Slow tick that re-runs the page stretch; see {@link #maintainPageExtent}. */
-    private static int sExtentTick;
-
     /**
-     * Re-runs the page stretch on a slow timer.
+     * Re-runs the page stretch on a slow timer, asked for from every frame.
      *
      * <p>The apps re-apply their own page metrics whenever they relayout, and
      * they do it silently — no layout change on any view we listen to. When
@@ -1679,24 +1711,18 @@ final class LiquidGlassInstaller {
      * the grey-and-white patchwork at the end of a scrolled list (#6).
      *
      * <p>Cheap by construction: every step inside {@link #extendPagesToBottom}
-     * bails out on its own when its gap is already closed, so this only ever
-     * costs a comparison — until something really did move, and then it repairs
-     * it within half a second instead of waiting for the next tab switch.
+     * bails out on its own when its gap is already closed, so a run costs a
+     * short walk of the pages down to their scrollers — until something really
+     * did move, and then it is repaired within half a second instead of at the
+     * next tab switch. The last run lands after the frames stop, which is
+     * exactly when a relayout that put the gap back has just finished drawing.
      */
-    private static void maintainPageExtent() {
+    private static final ClockThrottle sPageExtent = new ClockThrottle(500L, () -> {
         ViewGroup pager = sPagerRef.get();
-        if (pager == null || !pager.isAttachedToWindow()) {
-            return;
+        if (pager != null && pager.isAttachedToWindow()) {
+            extendPagesToBottom(pager);
         }
-        if ((++sExtentTick % 30) != 0) {
-            return;
-        }
-        pager.post(() -> {
-            if (sPagerRef.get() == pager) {
-                extendPagesToBottom(pager);
-            }
-        });
-    }
+    });
 
     /**
      * The sibling the glass refracts. WeChat puts the pager and the tab bar under
@@ -2168,9 +2194,12 @@ final class LiquidGlassInstaller {
 
     private static void attachRenderer(Context ctx, LiquidGlassHostLayout host,
                                        ViewGroup backdrop, float density) {
-        if (Build.VERSION.SDK_INT < 33) {
+        // RenderNode capture and RenderEffect blur are Android 12; below that
+        // the host's own software frost is all there is.
+        if (Build.VERSION.SDK_INT < LiquidGlassPanel.MIN_SDK) {
             LiquidGlassModule.log(android.util.Log.INFO,
-                    "SDK < 33, staying on the legacy frost path");
+                    "SDK < " + LiquidGlassPanel.MIN_SDK
+                            + ", staying on the legacy frost path");
             return;
         }
         try {
@@ -2223,16 +2252,9 @@ final class LiquidGlassInstaller {
                 host.setDragHandler(sDrag);
             }
 
-            // The backdrop is re-captured on each draw, so the glass follows the
-            // page behind it.
-            host.getViewTreeObserver().addOnPreDrawListener(() -> {
-                glass.invalidate();
-                return true;
-            });
-
             LiquidGlassModule.log(android.util.Log.INFO,
-                    "renderer=KernelSU-style lens (saturation+blur+SDF refraction)"
-                            + " supported=" + glass.isSupported()
+                    "renderer=KernelSU-style glass (saturation+blur"
+                            + (glass.hasLens() ? "+SDF refraction)" : ", no lens)")
                             + " drag=" + (tabRow != null));
         } catch (Throwable t) {
             LiquidGlassModule.logErr("glass renderer unavailable", t);

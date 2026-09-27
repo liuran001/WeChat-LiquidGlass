@@ -14,6 +14,7 @@ import android.graphics.Shader;
 import android.os.Build;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 
 import java.lang.ref.WeakReference;
 
@@ -40,8 +41,18 @@ import java.lang.ref.WeakReference;
  * further than {@code refractionHeight} from the edge is passed through
  * untouched, so only a band around the rim bends — the middle stays a plain
  * blurred, saturated view of what is behind it.
+ *
+ * <p>The capture, the saturation and the blur only need Android 12; the lens
+ * and the drag highlight are AGSL and need 13. Android 12 therefore gets the
+ * same frosted surface with a straight rim — rather than a software frost
+ * redrawn on the CPU every frame the pages move.
  */
 final class LiquidGlassPanel extends View {
+
+    /** RenderNode capture and RenderEffect blur; below this there is no glass panel. */
+    static final int MIN_SDK = 31;
+    /** AGSL, for the refracting rim and the drag highlight. */
+    static final int LENS_MIN_SDK = 33;
 
     /** KernelSU: lens(refractionHeight = 24.dp, refractionAmount = 24.dp). */
     private static final float REFRACTION_DP = 24f;
@@ -109,8 +120,12 @@ final class LiquidGlassPanel extends View {
     // Reused every frame: onDraw runs on each traversal, and allocating here
     // would churn the heap for nothing.
     private final int[] mSelf = new int[2];
-    private final int[] mSrc = new int[2];
-    private final android.graphics.Rect mVisible = new android.graphics.Rect();
+    private final int[] mProbe = new int[2];
+    /** Where and at what scale the last capture was taken; see {@link #backdropStale}. */
+    private final int[] mCapturedAt = new int[2];
+    private float mCapturedScale;
+    private boolean mCaptured;
+    private boolean mRecapturedLastFrame;
     private RuntimeShader mLens;
     private RenderEffect mChain;
     private int mChainW;
@@ -158,12 +173,26 @@ final class LiquidGlassPanel extends View {
     }
 
     private boolean mNight;
-    private int mBaseColor;
     private final Paint mSurfacePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mHighlightPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path mClip = new Path();
 
-    private boolean mSupported;
+    /** Cleared if drawing the glass ever throws; the flat wash stays. */
+    private boolean mSupported = true;
+
+    /**
+     * Re-captures whenever the capture has gone stale, and only then, so a
+     * screen where nothing moves stops drawing. Asked from the draw listener
+     * rather than pre-draw: that runs after every pre-draw listener, the
+     * selection watcher's pill moves included, and still ahead of the display
+     * lists being rebuilt, so the invalidate lands in this very frame. It also
+     * books one more traversal, which finds nothing stale and ends there.
+     */
+    private final ViewTreeObserver.OnDrawListener mStaleCheck = () -> {
+        if (backdropStale()) {
+            invalidate();
+        }
+    };
 
     LiquidGlassPanel(Context ctx, ViewGroup backdrop, float density, boolean night) {
         super(ctx);
@@ -177,13 +206,13 @@ final class LiquidGlassPanel extends View {
         cm.setSaturation(SATURATION);
         mSaturate = RenderEffect.createColorFilterEffect(new ColorMatrixColorFilter(cm));
 
-        mSupported = Build.VERSION.SDK_INT >= 33;
-        if (mSupported) {
+        if (Build.VERSION.SDK_INT >= LENS_MIN_SDK) {
             try {
                 mLens = new RuntimeShader(LENS_SHADER);
                 mHighlightShader = new RuntimeShader(HIGHLIGHT_SHADER);
             } catch (Throwable t) {
-                mSupported = false;
+                // Still frosted, just without the bent rim.
+                mLens = null;
                 LiquidGlassModule.logErr("lens shader rejected", t);
             }
         }
@@ -194,7 +223,6 @@ final class LiquidGlassPanel extends View {
     /** KernelSU: containerColor = surfaceContainer.copy(0.4f). */
     void setTheme(boolean night) {
         mNight = night;
-        mBaseColor = night ? 0xFF111111 : 0xFFF7F7F7;
         mSurfacePaint.setColor(night ? 0x662C2C2E : 0x66F2F2F7);
         // iosIndicatorSpecular: BloomStroke(white @ 0.12), width 1.dp, alpha 0.75.
         mHighlightPaint.setStyle(Paint.Style.STROKE);
@@ -203,8 +231,8 @@ final class LiquidGlassPanel extends View {
         invalidate();
     }
 
-    boolean isSupported() {
-        return mSupported;
+    boolean hasLens() {
+        return mLens != null;
     }
 
     /**
@@ -239,10 +267,63 @@ final class LiquidGlassPanel extends View {
         if (w <= 0 || h <= 0) {
             return;
         }
-        float radius = h * 0.5f;
+        // Noted whether or not the capture below succeeds: a capture that
+        // cannot be taken must not read as permanently stale.
+        mCaptured = true;
+        ViewGeom.unscaledScreenPos(this, mCapturedAt);
+        mCapturedScale = ViewGeom.cumulativeScale(this);
+        drawPanel(canvas, w, h, h * 0.5f, mNode, mCapturedAt, mCapturedScale);
+    }
 
-        drawPanel(canvas, w, h, radius, mNode,
-                ViewGeom.cumulativeScale(this));
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        getViewTreeObserver().addOnDrawListener(mStaleCheck);
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        getViewTreeObserver().removeOnDrawListener(mStaleCheck);
+        super.onDetachedFromWindow();
+    }
+
+    /**
+     * Whether the frame about to be drawn needs a fresh capture.
+     *
+     * <p>A capture is a recording of the pages as they stood, and it only goes
+     * out of date when they change or when the pill moves over them.
+     * Re-recording on every frame regardless — which is what this used to do —
+     * means asking for the next frame from inside this one, so the app never
+     * stopped drawing: a full frame rate on a screen where nothing moves.
+     *
+     * <p>A change is read off the pager's dirty flag, which every invalidation
+     * underneath it raises and its own draw clears. That flag is not ours
+     * though — anything that draws the tree by hand clears it too — so a frame
+     * that arrives without this having asked for it counts as a change as
+     * well. Should something keep redrawing where the flag cannot see it, that
+     * halves the capture rate; it never leaves the glass behind.
+     *
+     * <p>A pager that is not on screen is not drawn, so nothing ever clears its
+     * flag either; it is left alone until it is back rather than read as
+     * changing on every frame.
+     */
+    private boolean backdropStale() {
+        ViewGroup pager = mBackdropRef.get();
+        if (!mSupported || pager == null || getWidth() <= 0 || getHeight() <= 0
+                || !isShown() || getAlpha() == 0f || !pager.isShown()) {
+            // Nothing to show it on: taken afresh once there is again.
+            mCaptured = false;
+            mRecapturedLastFrame = false;
+            return false;
+        }
+        boolean stale = !mCaptured || !mRecapturedLastFrame || pager.isDirty();
+        if (!stale) {
+            ViewGeom.unscaledScreenPos(this, mProbe);
+            stale = mProbe[0] != mCapturedAt[0] || mProbe[1] != mCapturedAt[1]
+                    || ViewGeom.cumulativeScale(this) != mCapturedScale;
+        }
+        mRecapturedLastFrame = stale;
+        return stale;
     }
 
     /** Draws the resting pill material into the droplet's combined backdrop. */
@@ -252,14 +333,21 @@ final class LiquidGlassPanel extends View {
         if (w <= 0 || h <= 0) {
             return;
         }
-        drawPanel(canvas, w, h, h * 0.5f, mEmbeddedNode, 1f);
+        ViewGeom.unscaledScreenPos(this, mSelf);
+        drawPanel(canvas, w, h, h * 0.5f, mEmbeddedNode, mSelf, 1f);
     }
 
+    /**
+     * @param self this view's unscaled screen position. Scale-free because the
+     *     whole bar grows while dragged (KernelSU's layerBlock), and
+     *     getLocationOnScreen would report where this view lands after that
+     *     transform, not where its layout puts it.
+     */
     private void drawPanel(Canvas canvas, int w, int h, float radius,
-                           RenderNode node, float captureScale) {
+                           RenderNode node, int[] self, float captureScale) {
         if (mSupported && canvas.isHardwareAccelerated()) {
             try {
-                drawGlass(canvas, w, h, radius, node, captureScale);
+                drawGlass(canvas, w, h, radius, node, self, captureScale);
             } catch (Throwable t) {
                 mSupported = false;
                 LiquidGlassModule.logErr("glass draw failed, flat fallback", t);
@@ -278,7 +366,7 @@ final class LiquidGlassPanel extends View {
     /** KernelSU's InteractiveHighlight, drawn over the pill while dragging. */
     private void drawInteractiveHighlight(Canvas canvas, int w, int h, float radius) {
         float p = mInteraction;
-        if (p <= 0.01f || mHighlightShader == null) {
+        if (p <= 0.01f) {
             return;
         }
         int save = canvas.save();
@@ -292,19 +380,22 @@ final class LiquidGlassPanel extends View {
         canvas.drawRect(0, 0, w, h, mWashPlus);
 
         // KernelSU: White.copy(0.12f * progress), radius = size.minDimension * 1.2
-        mHighlightShader.setFloatUniform("size", w, h);
-        mHighlightShader.setFloatUniform("alpha", 0.12f * p);
-        mHighlightShader.setFloatUniform("radius", Math.min(w, h) * 1.2f);
-        mHighlightShader.setFloatUniform("position",
-                Math.max(0f, Math.min(mInteractionX, w)), h * 0.5f);
-        mBloom.setShader(mHighlightShader);
-        mBloom.setBlendMode(android.graphics.BlendMode.PLUS);
-        canvas.drawRect(0, 0, w, h, mBloom);
+        // The bloom is AGSL; without it the wash above still carries the press.
+        if (mHighlightShader != null) {
+            mHighlightShader.setFloatUniform("size", w, h);
+            mHighlightShader.setFloatUniform("alpha", 0.12f * p);
+            mHighlightShader.setFloatUniform("radius", Math.min(w, h) * 1.2f);
+            mHighlightShader.setFloatUniform("position",
+                    Math.max(0f, Math.min(mInteractionX, w)), h * 0.5f);
+            mBloom.setShader(mHighlightShader);
+            mBloom.setBlendMode(android.graphics.BlendMode.PLUS);
+            canvas.drawRect(0, 0, w, h, mBloom);
+        }
         canvas.restoreToCount(save);
     }
 
     private void drawGlass(Canvas canvas, int w, int h, float radius,
-                           RenderNode node, float captureScale) {
+                           RenderNode node, int[] self, float captureScale) {
         ViewGroup pager = mBackdropRef.get();
         if (pager == null || pager.getWidth() <= 0) {
             return;
@@ -313,15 +404,6 @@ final class LiquidGlassPanel extends View {
         int nw = w + mPad * 2;
         int nh = h + mPad * 2;
         node.setPosition(0, 0, nw, nh);
-
-        // Positions have to be scale-free: while dragging, the whole bar grows
-        // (KernelSU's layerBlock), so getLocationOnScreen would report where this
-        // view lands *after* that transform, not where its layout puts it.
-        int[] self = mSelf;
-        int[] src = mSrc;
-        if (!ViewGeom.unscaledScreenPos(this, self)) {
-            getLocationOnScreen(self);
-        }
 
         RecordingCanvas rc = node.beginRecording(nw, nh);
         try {
@@ -332,43 +414,7 @@ final class LiquidGlassPanel extends View {
                 rc.scale(1f / captureScale, 1f / captureScale,
                         nw * 0.5f, nh * 0.5f);
             }
-            // Lay down the page colour first. Any part of the node the pages do
-            // not cover — which happens as soon as WeChat slides the bar past the
-            // bottom of the content — is otherwise never drawn, and transparent
-            // black turns into solid black once it goes through the blur.
-            rc.drawColor(mBaseColor);
-            // Every page that is on screen, positioned by its own screen
-            // coordinates. Drawing only the "current" page leaves the other half
-            // of the bar with nothing to refract mid-swipe — it renders black.
-            // Drawing the pager instead is no good either: it reports scrollX 0
-            // regardless of the page shown, so it would always yield page 0.
-            android.graphics.Rect visible = mVisible;
-            boolean drewAny = false;
-            for (int i = 0; i < pager.getChildCount(); i++) {
-                View page = pager.getChildAt(i);
-                if (page.getVisibility() != VISIBLE
-                        || !page.getGlobalVisibleRect(visible)
-                        || visible.isEmpty()) {
-                    continue;
-                }
-                page.getLocationOnScreen(src);
-                float dx = mPad - (self[0] - src[0]);
-                float dy = mPad - (self[1] - src[1]);
-                int save = rc.save();
-                rc.translate(dx, dy);
-                // Clip after translating, i.e. in the page's own coordinates, so
-                // ViewGroup can reject non-intersecting children early. Clipping
-                // before the translate would reject everything.
-                rc.clipRect(-dx, -dy, -dx + nw, -dy + nh);
-                page.draw(rc);
-                rc.restoreToCount(save);
-                drewAny = true;
-            }
-            if (!drewAny) {
-                pager.getLocationOnScreen(src);
-                rc.translate(mPad - (self[0] - src[0]), mPad - (self[1] - src[1]));
-                pager.draw(rc);
-            }
+            Backdrop.draw(rc, pager, mNight, self[0] - mPad, self[1] - mPad, nw, nh);
         } finally {
             node.endRecording();
         }
@@ -377,19 +423,22 @@ final class LiquidGlassPanel extends View {
         // chain only has to be rebuilt when that changes. Building it per frame
         // meant three native effect objects churned on every single frame.
         if (mChain == null || mChainW != w || mChainH != h) {
-            mLens.setFloatUniform("size", w, h);
-            mLens.setFloatUniform("offset", -mPad, -mPad);
-            mLens.setFloatUniform("cornerRadii", radius, radius, radius, radius);
-            mLens.setFloatUniform("refractionHeight", REFRACTION_DP * mDensity);
-            // KernelSU passes the amount negated.
-            mLens.setFloatUniform("refractionAmount", -REFRACTION_DP * mDensity);
-            mLens.setFloatUniform("depthEffect", 0f);
-
             float blur = BLUR_DP * mDensity;
-            mChain = RenderEffect.createChainEffect(
-                    RenderEffect.createRuntimeShaderEffect(mLens, "content"),
-                    RenderEffect.createBlurEffect(blur, blur, mSaturate,
-                            Shader.TileMode.CLAMP));
+            RenderEffect frost = RenderEffect.createBlurEffect(blur, blur, mSaturate,
+                    Shader.TileMode.CLAMP);
+            if (mLens != null) {
+                mLens.setFloatUniform("size", w, h);
+                mLens.setFloatUniform("offset", -mPad, -mPad);
+                mLens.setFloatUniform("cornerRadii", radius, radius, radius, radius);
+                mLens.setFloatUniform("refractionHeight", REFRACTION_DP * mDensity);
+                // KernelSU passes the amount negated.
+                mLens.setFloatUniform("refractionAmount", -REFRACTION_DP * mDensity);
+                mLens.setFloatUniform("depthEffect", 0f);
+                mChain = RenderEffect.createChainEffect(
+                        RenderEffect.createRuntimeShaderEffect(mLens, "content"), frost);
+            } else {
+                mChain = frost;
+            }
             mChainW = w;
             mChainH = h;
         }

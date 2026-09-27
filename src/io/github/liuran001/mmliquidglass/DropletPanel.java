@@ -143,6 +143,10 @@ final class DropletPanel extends View {
     /** Page-only layer, blurred before the clear tab copy is composited over it. */
     private final RenderNode mBackdropNode = new RenderNode("wxDropletBackdrop");
     private RenderEffect mBackdropEffect;
+    /**
+     * AGSL, so Android 13; null below it, or once a shader has been rejected,
+     * and the droplet then stays the plain tinted capsule it is at rest.
+     */
     private RuntimeShader mLens;
     private RuntimeShader mInnerShader;
 
@@ -156,7 +160,6 @@ final class DropletPanel extends View {
     private final int[] mTmp = new int[2];
     private final int[] mSelf = new int[2];
     private final int[] mSrc = new int[2];
-    private final android.graphics.Rect mVisible = new android.graphics.Rect();
     private WeakReference<View> mPillRef = new WeakReference<>(null);
 
     /** The glass pill, redrawn into the droplet's backdrop as KernelSU does. */
@@ -377,7 +380,6 @@ final class DropletPanel extends View {
     }
 
     private float mProgress;
-    private boolean mSupported;
 
     DropletPanel(Context ctx, ViewGroup pager, ViewGroup tabRow,
                  float density, boolean night) {
@@ -387,8 +389,7 @@ final class DropletPanel extends View {
         mDensity = density;
         mPad = Math.round(AMOUNT_DP * density) + Math.round(density * 4f);
 
-        mSupported = Build.VERSION.SDK_INT >= 33;
-        if (mSupported) {
+        if (Build.VERSION.SDK_INT >= LiquidGlassPanel.LENS_MIN_SDK) {
             try {
                 mLens = new RuntimeShader(LENS_SHADER);
                 mInnerShader = new RuntimeShader(INNER_SHADOW_SHADER);
@@ -400,7 +401,7 @@ final class DropletPanel extends View {
                 mBackdropEffect = RenderEffect.createBlurEffect(
                         blur, blur, saturate, Shader.TileMode.CLAMP);
             } catch (Throwable t) {
-                mSupported = false;
+                mLens = null;
                 LiquidGlassModule.logErr("droplet shader rejected", t);
             }
         }
@@ -467,11 +468,11 @@ final class DropletPanel extends View {
         float p = mProgress;
 
         boolean drewLens = false;
-        if (mSupported && p > 0.01f && canvas.isHardwareAccelerated()) {
+        if (mLens != null && p > 0.01f && canvas.isHardwareAccelerated()) {
             try {
                 drewLens = drawLens(canvas, w, h, radius, p);
             } catch (Throwable t) {
-                mSupported = false;
+                mLens = null;
                 LiquidGlassModule.logErr("droplet lens failed", t);
             }
         }
@@ -551,36 +552,7 @@ final class DropletPanel extends View {
         mBackdropNode.setPosition(0, 0, nw, nh);
         RecordingCanvas c = mBackdropNode.beginRecording(nw, nh);
         try {
-            int[] src = mSrc;
-            c.drawColor(mNight ? 0xFF111111 : 0xFFF7F7F7);
-            android.graphics.Rect visible = mVisible;
-            boolean drewAny = false;
-            for (int i = 0; i < pager.getChildCount(); i++) {
-                View page = pager.getChildAt(i);
-                if (page.getVisibility() != VISIBLE
-                        || !page.getGlobalVisibleRect(visible) || visible.isEmpty()) {
-                    continue;
-                }
-                page.getLocationOnScreen(src);
-                int save = c.save();
-                c.translate(mPad - (self[0] - src[0]),
-                        mPad - (self[1] - src[1]));
-                c.clipRect(self[0] - src[0] - mPad,
-                        self[1] - src[1] - mPad,
-                        self[0] - src[0] - mPad + nw,
-                        self[1] - src[1] - mPad + nh);
-                page.draw(c);
-                c.restoreToCount(save);
-                drewAny = true;
-            }
-            if (!drewAny) {
-                pager.getLocationOnScreen(src);
-                int save = c.save();
-                c.translate(mPad - (self[0] - src[0]),
-                        mPad - (self[1] - src[1]));
-                pager.draw(c);
-                c.restoreToCount(save);
-            }
+            Backdrop.draw(c, pager, mNight, self[0] - mPad, self[1] - mPad, nw, nh);
         } finally {
             mBackdropNode.endRecording();
         }

@@ -25,7 +25,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
 
     static final Object GLASS_TAG = new Object();
 
-    /** Light frost fallback for devices without RuntimeShader. */
+    /** Software frost, for when no GPU glass is attached (below Android 12). */
     private static final float SAMPLE_SCALE_LEGACY = 0.4f;
     private static final int BLUR_RADIUS_LEGACY = 3;
     private static final float SATURATION_BOOST = 1.08f;
@@ -33,11 +33,16 @@ final class LiquidGlassHostLayout extends FrameLayout {
     private final ViewGroup mSampleRoot;
     private final float mDensity;
     private boolean mDarkMode;
-    private int mCaptureCount;
 
-    private final boolean mUseAgsl;
+    /**
+     * Re-reads dark/light so theme switches follow the app live. Asked on every
+     * frame, run at most every 300ms and once more after the frames stop: a
+     * theme switch redraws the screen for only a handful of frames.
+     */
+    private final ClockThrottle mThemeProbe = new ClockThrottle(300L, this::probeTheme);
+    private boolean mThemeProbed;
 
-    /** Tuner for the vendored QmDeve renderer (API 33+). Null = legacy frost path. */
+    /** Hooks for the GPU glass (LiquidGlassPanel). Null = the software frost here. */
     interface GlassTuner {
         void onSize(int w, int h, float cornerRadius);
         void onTheme(boolean dark);
@@ -226,6 +231,14 @@ final class LiquidGlassHostLayout extends FrameLayout {
     private float mCornerRadius;
     private Bitmap mRegionBuf;
     private boolean mCapturing;
+    /** Legacy frost: where and at what size the last capture was taken. */
+    private final int[] mRootLoc = new int[2];
+    private final int[] mSelfLoc = new int[2];
+    private int mCapturedDx;
+    private int mCapturedDy;
+    private int mCapturedW;
+    private int mCapturedH;
+    private boolean mCapturedLastFrame;
 
     private ViewTreeObserver.OnPreDrawListener mPreDrawListener;
     private int mShadowClipW = -1;
@@ -242,13 +255,11 @@ final class LiquidGlassHostLayout extends FrameLayout {
         mDensity = context.getResources().getDisplayMetrics().density;
         Boolean detected = detectDarkFromText(bar);
         mDarkMode = resolveDark(context, detected);
-        mUseAgsl = Build.VERSION.SDK_INT >= 33;
         setTag(GLASS_TAG);
         setWillNotDraw(false);
         setupPaints();
         LiquidGlassModule.log(android.util.Log.INFO,
                 "host created: sdk=" + Build.VERSION.SDK_INT
-                        + " path=" + (mUseAgsl ? "agsl" : "legacy-frost")
                         + " dark=" + mDarkMode + " source=" + darkSource(detected)
                         + " uiMode=" + isSystemNight(context)
                         + " textProbe=" + detected);
@@ -277,7 +288,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
                 ? "text-color" : "uiMode";
     }
 
-    /** Activates the vendored QmDeve renderer; disables internal frost drawing. */
+    /** Hands drawing to the GPU glass; the software frost stops for good. */
     void setGlassTuner(GlassTuner tuner) {
         mTuner = tuner;
         if (tuner != null) {
@@ -359,24 +370,22 @@ final class LiquidGlassHostLayout extends FrameLayout {
     }
 
     private void setupPaints() {
-        if (!mUseAgsl) {
-            if (mDarkMode) {
-                mTintPaint.setColor(0x33000000);
-                mBorderPaint.setColor(0x1FFFFFFF);
-                mBackdropPaint.setColor(0x40000000);
-            } else {
-                mTintPaint.setColor(0x4DFFFFFF);
-                mBorderPaint.setColor(0x2EFFFFFF);
-                mBackdropPaint.setColor(0x8CFFFFFF);
-            }
-            mBorderPaint.setStyle(Paint.Style.STROKE);
-            mBorderPaint.setStrokeWidth(Math.max(mDensity * 0.8f, 0.75f));
-            if (getWidth() > 0 && getHeight() > 0) {
-                mGlossPaint.setShader(new LinearGradient(
-                        0f, 0f, 0f, getHeight() * 0.45f,
-                        mDarkMode ? 0x14FFFFFF : 0x30FFFFFF,
-                        0x00FFFFFF, Shader.TileMode.CLAMP));
-            }
+        if (mDarkMode) {
+            mTintPaint.setColor(0x33000000);
+            mBorderPaint.setColor(0x1FFFFFFF);
+            mBackdropPaint.setColor(0x40000000);
+        } else {
+            mTintPaint.setColor(0x4DFFFFFF);
+            mBorderPaint.setColor(0x2EFFFFFF);
+            mBackdropPaint.setColor(0x8CFFFFFF);
+        }
+        mBorderPaint.setStyle(Paint.Style.STROKE);
+        mBorderPaint.setStrokeWidth(Math.max(mDensity * 0.8f, 0.75f));
+        if (getWidth() > 0 && getHeight() > 0) {
+            mGlossPaint.setShader(new LinearGradient(
+                    0f, 0f, 0f, getHeight() * 0.45f,
+                    mDarkMode ? 0x14FFFFFF : 0x30FFFFFF,
+                    0x00FFFFFF, Shader.TileMode.CLAMP));
         }
     }
 
@@ -400,6 +409,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
             mSampleRoot.getViewTreeObserver().removeOnPreDrawListener(mPreDrawListener);
             mPreDrawListener = null;
         }
+        mThemeProbe.cancel();
     }
 
     @Override
@@ -418,24 +428,18 @@ final class LiquidGlassHostLayout extends FrameLayout {
             mTuner.onSize(w - mShadowPad * 2, h - mShadowPad * 2, mCornerRadius);
             return;
         }
-        if (!mUseAgsl) {
-            mGlossPaint.setShader(new LinearGradient(
-                    0f, 0f, 0f, h * 0.45f,
-                    mDarkMode ? 0x1FFFFFFF : 0x40FFFFFF,
-                    0x00FFFFFF, Shader.TileMode.CLAMP));
-        }
-    }
-
-    private float sampleScale() {
-        return mUseAgsl ? 1.0f : SAMPLE_SCALE_LEGACY;
+        mGlossPaint.setShader(new LinearGradient(
+                0f, 0f, 0f, h * 0.45f,
+                mDarkMode ? 0x1FFFFFFF : 0x40FFFFFF,
+                0x00FFFFFF, Shader.TileMode.CLAMP));
     }
 
     private void capture() {
         try {
             mCapturing = true;
-            maybeRefreshTheme();
+            mThemeProbe.request();
             if (mTuner != null) {
-                // External GPU renderer records content itself; no bitmaps needed.
+                // LiquidGlassPanel records the pages itself; no bitmaps needed.
                 return;
             }
             int w = getWidth();
@@ -443,20 +447,38 @@ final class LiquidGlassHostLayout extends FrameLayout {
             if (w <= 0 || h <= 0 || mSampleRoot.getWidth() <= 0) {
                 return;
             }
+            if (!mSampleRoot.isShown()) {
+                // Undrawn, so its dirty flag never clears; forced afresh instead
+                // once it is back.
+                mCapturedLastFrame = false;
+                return;
+            }
+            mSampleRoot.getLocationOnScreen(mRootLoc);
+            getLocationOnScreen(mSelfLoc);
+            int dx = mSelfLoc[0] - mRootLoc[0];
+            int dy = mSelfLoc[1] - mRootLoc[1];
+            // The rule LiquidGlassPanel.backdropStale spells out, and it matters
+            // more here: this is a software pass over the pages, and the
+            // invalidate at the end used to ask for the next one straight away,
+            // on every frame for as long as the bar was up.
+            boolean stale = mRegionBuf == null || !mCapturedLastFrame
+                    || mSampleRoot.isDirty()
+                    || dx != mCapturedDx || dy != mCapturedDy
+                    || w != mCapturedW || h != mCapturedH;
+            mCapturedLastFrame = stale;
+            if (!stale) {
+                return;
+            }
+            mCapturedDx = dx;
+            mCapturedDy = dy;
+            mCapturedW = w;
+            mCapturedH = h;
             ensureRegionBuffer(w, h);
 
             Canvas c = new Canvas(mRegionBuf);
-            float scale = sampleScale();
-            int[] rootLoc = new int[2];
-            int[] selfLoc = new int[2];
-            mSampleRoot.getLocationOnScreen(rootLoc);
-            getLocationOnScreen(selfLoc);
-            float dx = selfLoc[0] - rootLoc[0];
-            float dy = selfLoc[1] - rootLoc[1];
-
             c.save();
             c.clipRect(0f, 0f, w, h);
-            c.scale(scale, scale);
+            c.scale(SAMPLE_SCALE_LEGACY, SAMPLE_SCALE_LEGACY);
             c.translate(-dx, -dy);
             int vis = getVisibility();
             setVisibility(INVISIBLE);
@@ -468,9 +490,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
             }
 
             applySaturationBoost(mRegionBuf);
-            if (!mUseAgsl) {
-                StackBlur.blur(mRegionBuf, BLUR_RADIUS_LEGACY);
-            }
+            StackBlur.blur(mRegionBuf, BLUR_RADIUS_LEGACY);
             invalidate();
         } catch (Throwable t) {
             LiquidGlassModule.logErr("capture failed", t);
@@ -480,9 +500,8 @@ final class LiquidGlassHostLayout extends FrameLayout {
     }
 
     private void ensureRegionBuffer(int w, int h) {
-        float scale = sampleScale();
-        int bw = Math.max(Math.round(w * scale), 1);
-        int bh = Math.max(Math.round(h * scale), 1);
+        int bw = Math.max(Math.round(w * SAMPLE_SCALE_LEGACY), 1);
+        int bh = Math.max(Math.round(h * SAMPLE_SCALE_LEGACY), 1);
         if (mRegionBuf == null
                 || mRegionBuf.isRecycled()
                 || mRegionBuf.getWidth() != bw
@@ -497,20 +516,16 @@ final class LiquidGlassHostLayout extends FrameLayout {
         }
     }
 
-    /** Re-evaluates dark/light periodically so theme switches follow the app
-     *  live, through the same signal {@link #resolveDark} picked at install. */
-    private void maybeRefreshTheme() {
-        mCaptureCount++;
-        if (mCaptureCount % 20 != 1) {
-            return;
-        }
+    /** Reads dark/light through the same signal {@link #resolveDark} picked at install. */
+    private void probeTheme() {
         // Only walk the labels for the apps that are decided by them; for the
         // rest this stays the config read it always was.
         HostApp app = LiquidGlassModule.app();
         Boolean probe = app != null && app.preferTextColorProbe
                 ? detectDarkFromText(mBar) : null;
         boolean detected = resolveDark(getContext(), probe);
-        if (mCaptureCount == 1) {
+        if (!mThemeProbed) {
+            mThemeProbed = true;
             LiquidGlassModule.log(android.util.Log.INFO,
                     "theme probe first sample: dark=" + detected
                             + " current=" + mDarkMode);
@@ -540,7 +555,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
         super.onDraw(canvas);
         drawPillShadow(canvas);
         if (mTuner != null) {
-            // Vendored renderer draws as child view index 0 beneath us.
+            // LiquidGlassPanel draws as child view index 0 beneath us.
             return;
         }
         if (getWidth() <= 0 || getHeight() <= 0) {
