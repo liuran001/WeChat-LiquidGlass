@@ -69,12 +69,14 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
     private float mDownY;
     private float mDragStartValue;
     private boolean mDragging;
+    private int mActivePointerId = -1;
+    private boolean mGestureEligible;
     private boolean mReleasePending;
 
     private long mLastFrameNs;
     private boolean mFrameScheduled;
 
-    /** Scratch for {@link #originInHost}; every use is on the UI thread. */
+    /** Scratch for native tab positions; every use is on the UI thread. */
     private final int[] mPos = new int[2];
 
     /** Velocity is tracked over the value (tab units), as KernelSU does. */
@@ -181,7 +183,10 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 mDownX = ev.getX();
                 mDownY = ev.getY();
                 mDragging = false;
-                boolean over = overDroplet(ev);
+                mActivePointerId = ev.getPointerId(0);
+                mGestureEligible = overTabRow(mDownX, mDownY);
+                mDragStartValue = Math.round(valueAtX(mDownX));
+                boolean over = mGestureEligible && overDroplet(ev);
                 if (over) {
                     press();
                     schedule();
@@ -196,19 +201,25 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 if (droplet == null || droplet.getVisibility() != View.VISIBLE) {
                     return false;
                 }
-                float dx = ev.getX() - mDownX;
-                float dy = ev.getY() - mDownY;
+                int pointer = ev.findPointerIndex(mActivePointerId);
+                if (!mGestureEligible || pointer < 0) return false;
+                float dx = ev.getX(pointer) - mDownX;
+                float dy = ev.getY(pointer) - mDownY;
                 if (Math.abs(dx) > mTouchSlop && Math.abs(dx) > Math.abs(dy)) {
                     mDragging = true;
-                    mDragStartValue = mValue.target();
                     press();
                     schedule();
                     return true;
                 }
                 return false;
             }
-            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_DOWN:
             case MotionEvent.ACTION_CANCEL:
+                cancelGesture();
+                return false;
+            case MotionEvent.ACTION_UP:
+                mGestureEligible = false;
+                mActivePointerId = -1;
                 release();
                 return false;
             default:
@@ -225,16 +236,22 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         int tabCount = tabCount(tabRow);
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_MOVE: {
-                float tabWidth = tabWidth(tabRow);
-                if (tabWidth > 0f) {
-                    float v = mDragStartValue + (ev.getX() - mDownX) / tabWidth;
-                    mValue.animateTo(clamp(v, 0f, tabCount - 1f));
-                    schedule();
+                int pointer = ev.findPointerIndex(mActivePointerId);
+                if (pointer < 0) {
+                    cancelGesture();
+                    return true;
                 }
+                float v = mDragStartValue + valueAtX(ev.getX(pointer)) - valueAtX(mDownX);
+                mValue.animateTo(clamp(v, 0f, tabCount - 1f));
+                schedule();
                 return true;
             }
-            case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL: {
+            case MotionEvent.ACTION_CANCEL:
+            case MotionEvent.ACTION_POINTER_DOWN:
+            case MotionEvent.ACTION_POINTER_UP:
+                cancelGesture();
+                return true;
+            case MotionEvent.ACTION_UP: {
                 // KernelSU's onDragStopped: settle to the nearest index, then let
                 // that index flow back through the selection as the single source
                 // of truth. We only report it; the watcher drives the spring.
@@ -242,6 +259,8 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 mValue.animateTo(index);
                 mVelocity.animateTo(0f);
                 mDragging = false;
+                mGestureEligible = false;
+                mActivePointerId = -1;
                 release();
                 View tab = TabBarBridge.tabAt(tabRow, index);
                 if (tab != null && !tab.isSelected()) {
@@ -267,7 +286,49 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         float left = droplet.getLeft() + droplet.getTranslationX();
         ViewGroup.LayoutParams lp = droplet.getLayoutParams();
         float width = lp != null && lp.width > 0 ? lp.width : droplet.getWidth();
-        return x >= left && x <= left + width;
+        float top = droplet.getTop() + droplet.getTranslationY();
+        return x >= left && x <= left + width
+                && ev.getY() >= top && ev.getY() <= top + droplet.getHeight();
+    }
+
+    /** Cancellation is never navigation (including a second pointer). */
+    private void cancelGesture() {
+        mDragging = false;
+        mGestureEligible = false;
+        mActivePointerId = -1;
+        int selected = TabBarBridge.selectedIndex(mTabRowRef.get());
+        if (selected >= 0) mValue.animateTo(selected);
+        mVelocity.animateTo(0f);
+        release();
+    }
+
+    private boolean overTabRow(float x, float y) {
+        ViewGroup row = mTabRowRef.get();
+        View host = mHostRef.get();
+        for (int i = 0; i < TabBarBridge.tabCount(row); i++) {
+            View tab = TabBarBridge.tabAt(row, i);
+            if (tab != null && ViewGeom.positionIn(tab, host, mPos)
+                    && x >= mPos[0] && x < mPos[0] + tab.getWidth()
+                    && y >= mPos[1] && y < mPos[1] + tab.getHeight()) return true;
+        }
+        return false;
+    }
+
+    private float tabCentre(int index) {
+        View tab = TabBarBridge.tabAt(mTabRowRef.get(), index);
+        if (tab == null || !ViewGeom.positionIn(tab, mHostRef.get(), mPos)) return 0f;
+        return mPos[0] + tab.getWidth() * 0.5f;
+    }
+
+    /** Piecewise native centres handle gaps and unequal columns without drift. */
+    private float valueAtX(float x) {
+        int count = TabBarBridge.tabCount(mTabRowRef.get());
+        if (count <= 1 || x <= tabCentre(0)) return 0f;
+        for (int i = 1; i < count; i++) {
+            float left = tabCentre(i - 1), right = tabCentre(i);
+            if (x <= right && right > left) return i - 1f + (x - left) / (right - left);
+        }
+        return count - 1f;
     }
 
     /* ---------------- press / release ---------------- */
@@ -368,21 +429,16 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         if (droplet == null || tabRow == null || TabBarBridge.tabCount(tabRow) == 0) {
             return;
         }
-        float tabWidth = tabWidth(tabRow);
-        if (tabWidth <= 0f) {
-            return;
-        }
-        // Centre using the laid-out width, not getWidth(): the droplet is sized
-        // through LayoutParams and getWidth() still reads 0 until the next layout
-        // pass, which parked it half a tab off on the first frame after launch.
-        View first = TabBarBridge.tabAt(tabRow, 0);
-        if (first == null) {
-            return;
-        }
         ViewGroup.LayoutParams lp = droplet.getLayoutParams();
         float dropletW = lp != null && lp.width > 0 ? lp.width : droplet.getWidth();
-        float originX = originInHost(tabRow, first, dropletW);
-        droplet.setTranslationX(originX + mValue.value() * tabWidth);
+        int count = TabBarBridge.tabCount(tabRow);
+        float value = clamp(mValue.value(), 0f, count - 1f);
+        int lo = (int) value;
+        int hi = Math.min(lo + 1, count - 1);
+        float centre = tabCentre(lo) + (tabCentre(hi) - tabCentre(lo)) * (value - lo);
+        View owner = mHostRef.get();
+        float pad = owner instanceof ViewGroup ? ((ViewGroup) owner).getPaddingLeft() : 0f;
+        droplet.setTranslationX(centre - dropletW * 0.5f - pad);
 
         // KernelSU:
         //   scaleX /= 1f - (velocity * 0.75f).coerceIn(-0.2f, 0.2f)
@@ -419,9 +475,9 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 // Droplet centre in the pill's own coordinates. translationX is
                 // an offset from the laid-out left, and that left already carries
                 // the host's shadow padding, so both sides need it.
-                float centre = droplet.getLeft() + droplet.getTranslationX()
+                float highlightCentre = droplet.getLeft() + droplet.getTranslationX()
                         + dropletW * 0.5f - pill.getLeft();
-                ((LiquidGlassPanel) pill).setInteraction(p, centre);
+                ((LiquidGlassPanel) pill).setInteraction(p, highlightCentre);
             }
         }
         applyFocusZoom(tabRow, p);
@@ -443,35 +499,6 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 tab.setScaleY(1f);
             }
         }
-    }
-
-    /**
-     * Resting x of the first tab column, expressed as a translation for a
-     * droplet that is laid out at the host's padding origin.
-     *
-     * <p>Measured through the tree rather than from the row's own {@code
-     * getLeft()}: on QQ the row <em>is</em> the bar view, so that left already
-     * includes the host's shadow padding, and adding it to a position that
-     * starts at the host's padding counted the padding twice — the droplet rode
-     * one padding to the right of its tab, outside the pill.
-     */
-    private float originInHost(ViewGroup tabRow, View first, float dropletW) {
-        float centre = (first.getWidth() - dropletW) * 0.5f;
-        View host = mHostRef.get();
-        if (host instanceof ViewGroup
-                && ViewGeom.positionIn(tabRow, host, mPos)) {
-            return mPos[0] + first.getLeft() + centre
-                    - ((ViewGroup) host).getPaddingLeft();
-        }
-        return tabRow.getLeft() + first.getLeft() + centre;
-    }
-
-    private static float tabWidth(ViewGroup tabRow) {
-        if (tabRow == null || TabBarBridge.tabCount(tabRow) == 0) {
-            return 0f;
-        }
-        View first = TabBarBridge.tabAt(tabRow, 0);
-        return first == null ? 0f : first.getWidth();
     }
 
     private static int tabCount(ViewGroup tabRow) {

@@ -136,7 +136,11 @@ public class LiquidGlassModule extends XposedModule {
                 + " classLoader=" + param.getDefaultClassLoader());
         // The tab bar bridge needs the app's own classes, so it can only be
         // wired once the app class loader exists.
-        TabBarBridge.install(app, param.getDefaultClassLoader());
+        ClassLoader cl = param.getDefaultClassLoader();
+        TabBarBridge.install(app, cl);
+        if (app == HostApp.BILIBILI) {
+            BiliGlass.install(cl);
+        }
     }
 
     static void log(int prio, String msg) {

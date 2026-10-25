@@ -80,7 +80,31 @@ final class HostApp {
             true,
             "com.tencent.mobileqq.");
 
-    private static final HostApp[] ALL = {WECHAT, QQ};
+    /**
+     * Bilibili 9.16.1, read off a live {@code MainActivityV2}.
+     *
+     * <p>The home frame is the same shape as the other two: a full-bleed content
+     * sibling with {@code WindowAwareComposeView} (id {@code tab_host}) floating
+     * on the bottom of it. The bar itself is Compose, so it has no tab child
+     * views and paints its own opaque fill. Those two differences are handled
+     * beside this table — see {@code BiliGlass} and {@code BiliTabMirror}.
+     * The bar's parent is a {@code CoordinatorLayout}, so the pill has to be
+     * anchored with that class's own layout params or it sticks to the top.
+     */
+    static final HostApp BILIBILI = new HostApp(
+            "tv.danmaku.bili",
+            "tv.danmaku.bili.MainActivityV2",
+            new String[]{
+                    "tv.danmaku.bili.home.components.bottomtab.WindowAwareComposeView",
+            },
+            new String[0],
+            "",
+            new String[0],
+            new String[0],
+            false,
+            "tv.danmaku.bili.");
+
+    private static final HostApp[] ALL = {WECHAT, QQ, BILIBILI};
 
     /** Package name, which is also the name of the process the home screen lives in. */
     final String pkg;

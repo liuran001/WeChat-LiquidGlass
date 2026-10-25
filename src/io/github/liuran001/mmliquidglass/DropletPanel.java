@@ -245,6 +245,10 @@ final class DropletPanel extends View {
                 || tab.getWidth() <= 0 || tab.getHeight() <= 0) {
             return;
         }
+        if (BiliTabMirror.isMirrorColumn(tab)) {
+            drawTabContent(c, tab);
+            return;
+        }
         if (tab.isSelected()) {
             // The selected tab is already painted in the accent colour by the
             // app itself, so the tint has nothing to add — and QQ's selected
@@ -252,7 +256,7 @@ final class DropletPanel extends View {
             // cut into it, which a flat SRC_ATOP pass would collapse into a
             // silhouette. Drawn as-is it keeps that detail, and its badge with
             // it. The tint is for the tabs the droplet is sliding *towards*.
-            tab.draw(c);
+            drawTabContent(c, tab);
             return;
         }
         int w = tab.getWidth();
@@ -261,7 +265,7 @@ final class DropletPanel extends View {
         // own bounds, so the layer is grown rather than clipped to them.
         float pad = h * 0.5f;
         int l = c.saveLayer(-pad, -pad, w + pad, h + pad, null);
-        tab.draw(c);
+        drawTabContent(c, tab);
         mAccent.setColor(accent);
         mAccent.setXfermode(SRC_ATOP);
         c.drawRect(-pad, -pad, w + pad, h + pad, mAccent);
@@ -289,9 +293,20 @@ final class DropletPanel extends View {
                     mBadgeClip.addRoundRect(r, rr, rr, Path.Direction.CW);
                 }
                 c.clipPath(mBadgeClip);
-                tab.draw(c);
+                drawTabContent(c, tab);
                 c.restoreToCount(s);
             }
+        }
+    }
+
+    /**
+     * WeChat and QQ draw the real tab. Bilibili's columns are empty stand-ins,
+     * so the same call paints the compose bar's icon and title for that column.
+     * Anything else keeps {@link View#draw(Canvas)}.
+     */
+    private void drawTabContent(Canvas c, View tab) {
+        if (!BiliTabMirror.drawColumn(tab, c)) {
+            tab.draw(c);
         }
     }
 
@@ -539,7 +554,7 @@ final class DropletPanel extends View {
         }
         int save = canvas.save();
         canvas.translate(mSrc[0] - mSelf[0], mSrc[1] - mSelf[1]);
-        tab.draw(canvas);
+        drawTabContent(canvas, tab);
         canvas.restoreToCount(save);
     }
 
